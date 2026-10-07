@@ -18,6 +18,10 @@ object BridgeSettings {
     private const val KEY_API_KEY = "api_key"
     private const val KEY_LAN_KEY = "lan_key"
     private const val KEY_LAN = "lan_enabled"
+    private const val KEY_AGGREGATE = "aggregate_non_stream"
+    private const val KEY_FORMAT_ANTHROPIC = "format_anthropic"
+    private const val KEY_DISGUISE = "disguise_client_identity"
+    private const val KEY_FORMAT_RESPONSES = "format_responses"
     private const val KEY_STEALTH = "stealth_enabled"
     private const val KEY_DOT_X = "dot_x"
     private const val KEY_DOT_Y = "dot_y"
@@ -234,6 +238,66 @@ object BridgeSettings {
     fun setLanEnabled(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_LAN, value).apply()
+    }
+
+    /**
+     * Whether a client asking for a single response gets one.
+     *
+     * The upstream has no non-streaming mode, so serving such a client means
+     * collecting its stream here. That is off by default because the collection
+     * holds the whole answer in memory and delays the first byte until the
+     * generation finishes, which is a real cost for anyone who did not need it.
+     */
+    fun aggregateNonStream(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AGGREGATE, false)
+
+    /**
+     * Whether the Anthropic Messages endpoint is served.
+     *
+     * Off by default: the endpoint translates a different request shape, and a
+     * user who does not have a client speaking it gains nothing from it being
+     * open.
+     */
+    fun formatAnthropic(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_FORMAT_ANTHROPIC, false)
+
+    fun setFormatAnthropic(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_FORMAT_ANTHROPIC, value).apply()
+    }
+
+    /**
+     * Whether a client's self-identifying system prompt is rewritten.
+     *
+     * The upstream refuses one specific identity string, so a client that sends
+     * it cannot be served at all. Rewriting it changes neither the request's
+     * meaning nor the model's behaviour; it only removes words the upstream
+     * rejects. Off by default, and only offered where it applies.
+     */
+    fun disguiseIdentity(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_DISGUISE, false)
+
+    fun setDisguiseIdentity(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_DISGUISE, value).apply()
+    }
+
+    /** Whether the OpenAI Responses endpoint is served. */
+    fun formatResponses(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_FORMAT_RESPONSES, false)
+
+    fun setFormatResponses(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_FORMAT_RESPONSES, value).apply()
+    }
+
+    fun setAggregateNonStream(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_AGGREGATE, value).apply()
     }
 
     fun opacity(context: Context): Float =

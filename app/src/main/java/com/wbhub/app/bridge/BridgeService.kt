@@ -89,6 +89,10 @@ class BridgeService : Service() {
                 // restarts the service, and the flag is one of the things it
                 // must pick up.
                 lanEnabled = BridgeSettings.lanEnabled(this),
+                aggregateNonStream = BridgeSettings.aggregateNonStream(this),
+                anthropicEnabled = BridgeSettings.formatAnthropic(this),
+                responsesEnabled = BridgeSettings.formatResponses(this),
+                disguiseIdentity = BridgeSettings.disguiseIdentity(this),
                 onCall = { record -> callLog.append(record) },
             ).also { it.start() }
             scope.launch { refreshModelsLoop() }
@@ -192,6 +196,10 @@ class BridgeService : Service() {
             models = { models },
             multiplierOf = { id -> catalogue.firstOrNull { it.id == id }?.multiplier ?: -1.0 },
             lanEnabled = BridgeSettings.lanEnabled(this),
+            aggregateNonStream = BridgeSettings.aggregateNonStream(this),
+            anthropicEnabled = BridgeSettings.formatAnthropic(this),
+            responsesEnabled = BridgeSettings.formatResponses(this),
+            disguiseIdentity = BridgeSettings.disguiseIdentity(this),
             onCall = { record -> callLog.append(record) },
         ).also { it.start() }
         BridgeStatus.reset(port)

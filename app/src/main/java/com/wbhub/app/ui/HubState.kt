@@ -37,6 +37,18 @@ data class HubState(
     val secret: String = "wb-local",
     /** Whether the endpoint also answers on the local network. */
     val lanEnabled: Boolean = false,
+    /** Whether a client asking for a single response is served one. */
+    val aggregateNonStream: Boolean = false,
+    /** Whether the Anthropic Messages dialect is served. */
+    val formatAnthropic: Boolean = false,
+    /** Whether the OpenAI Responses dialect is served. */
+    val formatResponses: Boolean = false,
+    /** Whether a client's self-identifying system prompt is rewritten. */
+    val disguiseIdentity: Boolean = false,
+    /** Whether the prompt offering the disguise is open. */
+    val showDisguisePrompt: Boolean = false,
+    /** Whether the API platform's advanced settings sheet is open. */
+    val showBridgeAdvanced: Boolean = false,
     /** Key peers on the network must present; separate from the local one. */
     val lanKey: String = "wb-lan",
     /** Addresses a peer on the same network can use, empty when none. */

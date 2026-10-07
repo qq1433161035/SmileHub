@@ -4,6 +4,7 @@ import com.wbhub.app.proto.Credential
 import com.wbhub.app.proto.UpstreamClient
 import com.wbhub.app.proto.Wire
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.InputStream
@@ -45,6 +46,20 @@ class BridgeServer(
      * in clear text over plain HTTP.
      */
     private val lanEnabled: Boolean = false,
+    /**
+     * Whether a client asking for a single response gets one.
+     *
+     * The upstream only streams, so such a client is served by collecting the
+     * frames here. Off by default: the collection holds the whole answer and
+     * delays the first byte until generation ends.
+     */
+    private val aggregateNonStream: Boolean = false,
+    /** Whether the Anthropic Messages shape is served. */
+    private val anthropicEnabled: Boolean = false,
+    /** Whether the OpenAI Responses shape is served. */
+    private val responsesEnabled: Boolean = false,
+    /** Whether a client's self-identifying system prompt is rewritten. */
+    private val disguiseIdentity: Boolean = false,
     private val onCall: (CallRecord) -> Unit = {},
 ) {
 
@@ -179,7 +194,11 @@ class BridgeServer(
                     sendJson(output, 200, """{"object":"list","data":[$list]}""")
                 }
                 requestLine.startsWith("POST /v1/chat/completions") ->
-                    chat(output, body, headers["content-type"], sourceIp)
+                    chat(output, body, headers["content-type"], sourceIp, ApiFormat.OPENAI)
+                requestLine.startsWith("POST /v1/messages") ->
+                    chat(output, body, headers["content-type"], sourceIp, ApiFormat.ANTHROPIC)
+                requestLine.startsWith("POST /v1/responses") ->
+                    chat(output, body, headers["content-type"], sourceIp, ApiFormat.RESPONSES)
                 else -> sendJson(output, 404, """{"error":{"message":"not found","type":"not_found"}}""")
             }
         } catch (e: Exception) {
@@ -188,6 +207,18 @@ class BridgeServer(
         } finally {
             runCatching { socket.close() }
         }
+    }
+
+    /**
+     * Whether a dialect is open for use.
+     *
+     * Chat Completions is what the upstream speaks, so it is always available;
+     * the other two are translations and are opt-in.
+     */
+    private fun formatEnabled(format: ApiFormat): Boolean = when (format) {
+        ApiFormat.OPENAI -> true
+        ApiFormat.ANTHROPIC -> anthropicEnabled
+        ApiFormat.RESPONSES -> responsesEnabled
     }
 
     /** Reads one CRLF-terminated line as bytes; the request head is ASCII. */
@@ -201,7 +232,13 @@ class BridgeServer(
         }
     }
 
-    private fun chat(output: OutputStream, body: String, contentType: String?, sourceIp: String) {
+    private fun chat(
+        output: OutputStream,
+        body: String,
+        contentType: String?,
+        sourceIp: String,
+        format: ApiFormat,
+    ) {
         // The upstream rejects non-JSON, and allowing form posts would let a
         // simple cross-site request drive a paid model call.
         if (contentType == null || !contentType.trim().lowercase().startsWith("application/json")) {
@@ -217,9 +254,24 @@ class BridgeServer(
             sendJson(output, 400, """{"error":{"message":"invalid json"}}""")
             return
         }
-        val model = runCatching { JSONObject(body).optString("model") }.getOrDefault("")
+        val request = runCatching { JSONObject(body) }.getOrNull() ?: JSONObject()
+        val model = request.optString("model")
+        // Read before the body is rewritten: prepareChatBody forces stream:true
+        // for the upstream, which would lose what the client actually asked for.
+        val wantsStream = ApiAdapters.wantsStream(request, format)
+        // Whether this dialect may be used at all is a setting, because each one
+        // widens what a caller can reach.
+        if (!formatEnabled(format)) {
+            sendJson(output, 404, """{"error":{"message":"not found","type":"not_found"}}""")
+            return
+        }
+        // A request for a single response is only honoured when the feature is
+        // on; otherwise the stream is passed through as before, which is what a
+        // client parsing SSE expects anyway.
+        val serveWholeResponse = !wantsStream && aggregateNonStream
+        val upstreamBody = ApiAdapters.toChatBody(request, format, disguiseIdentity).toString()
         val started = System.currentTimeMillis()
-        when (val result = client.chatStream(cred, body)) {
+        when (val result = client.chatStream(cred, upstreamBody)) {
             is UpstreamClient.ChatResult.Failed -> {
                 val detail = Wire.displayError(result.message) ?: result.message.take(200)
                 BridgeStatus.recordError("${result.kind.name.lowercase()}: $detail")
@@ -247,7 +299,15 @@ class BridgeServer(
             }
             is UpstreamClient.ChatResult.Ok -> {
                 try {
-                    val usage = relay(output, result, model)
+                    // The upstream only speaks SSE (it rejects stream:false with
+                    // code 11101), so a client asking for a single response is
+                    // served by aggregating that stream here rather than by
+                    // asking the upstream for something it will not do.
+                    val usage = if (serveWholeResponse) {
+                        aggregate(output, result, model, format)
+                    } else {
+                        relay(output, result, model, format)
+                    }
                     onCall(
                         CallRecord(
                             timestamp = started,
@@ -270,12 +330,130 @@ class BridgeServer(
     }
 
     /**
+     * Reads the upstream stream and answers with one JSON body.
+     *
+     * The upstream has no non-streaming mode (it refuses `stream:false` with
+     * code 11101), so a client that asked for a single response is served by
+     * collecting the frames here. The deltas are concatenated in arrival order
+     * and the result is shaped like a normal completion, which is what such a
+     * client parses.
+     */
+    private fun aggregate(
+        output: OutputStream,
+        result: UpstreamClient.ChatResult.Ok,
+        model: String,
+        format: ApiFormat,
+    ): SseUsage {
+        val content = StringBuilder()
+        val reasoning = StringBuilder()
+        val calls = JSONArray()
+        var usage = SseUsage()
+        val buffer = ByteArray(4096)
+        val tail = StringBuilder()
+        // Frames arrive split across reads, so a carry holds an incomplete line
+        // until the rest of it shows up.
+        var carry = ""
+        try {
+            while (true) {
+                val read = result.stream.read(buffer)
+                if (read < 0) break
+                tail.append(String(buffer, 0, read, StandardCharsets.UTF_8))
+                if (tail.length > USAGE_SCAN_BYTES) {
+                    tail.delete(0, tail.length - USAGE_SCAN_BYTES)
+                }
+                usage = parseUsage(tail.toString()) ?: usage
+
+                carry += String(buffer, 0, read, StandardCharsets.UTF_8)
+                val lines = carry.split("\n")
+                carry = lines.last()
+                for (line in lines.dropLast(1)) {
+                    val trimmed = line.trim()
+                    if (!trimmed.startsWith("data:")) continue
+                    val payload = trimmed.removePrefix("data:").trim()
+                    if (payload.isEmpty() || payload == "[DONE]") continue
+                    val chunk = runCatching { JSONObject(payload) }.getOrNull() ?: continue
+                    val delta = chunk.optJSONArray("choices")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("delta") ?: continue
+                    delta.optString("content").takeIf { it.isNotEmpty() }?.let { content.append(it) }
+                    delta.optString("reasoning_content").takeIf { it.isNotEmpty() }
+                        ?.let { reasoning.append(it) }
+                    delta.optJSONArray("tool_calls")?.let { mergeToolCalls(calls, it) }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "chat aggregation interrupted", e)
+        }
+
+        val message = JSONObject().apply {
+            put("role", "assistant")
+            put("content", content.toString())
+            if (reasoning.isNotEmpty()) put("reasoning_content", reasoning.toString())
+            if (calls.length() > 0) put("tool_calls", calls)
+        }
+        val payload = JSONObject().apply {
+            put("id", "chatcmpl-" + System.currentTimeMillis())
+            put("object", "chat.completion")
+            put("created", System.currentTimeMillis() / 1000)
+            put("model", model)
+            put("choices", JSONArray().put(JSONObject().apply {
+                put("index", 0)
+                put("message", message)
+                // Tool calls end a turn the same way they do when streamed.
+                put("finish_reason", if (calls.length() > 0) "tool_calls" else "stop")
+            }))
+            put("usage", JSONObject().apply {
+                put("prompt_tokens", usage.prompt)
+                put("completion_tokens", usage.completion)
+                put("total_tokens", usage.prompt + usage.completion)
+            })
+        }
+        // A translated dialect reshapes the whole body at once, which is
+        // simpler than mapping it field by field as it is assembled.
+        val answer = ApiAdapters.fromChatResponse(payload, format, model)
+        sendJson(output, 200, answer.toString())
+        return usage
+    }
+
+    /**
+     * Folds one frame's tool-call fragments into the accumulated set.
+     *
+     * Arguments arrive split across frames and are keyed by index, so a call
+     * accumulates its string until the stream ends; the name only appears on
+     * the first fragment.
+     */
+    private fun mergeToolCalls(sink: JSONArray, deltas: JSONArray) {
+        for (i in 0 until deltas.length()) {
+            val row = deltas.optJSONObject(i) ?: continue
+            val index = row.optInt("index", i)
+            while (sink.length() <= index) {
+                sink.put(JSONObject().apply {
+                    put("id", "")
+                    put("type", "function")
+                    put("function", JSONObject().apply { put("name", ""); put("arguments", "") })
+                })
+            }
+            val target = sink.optJSONObject(index) ?: continue
+            val fn = target.optJSONObject("function") ?: continue
+            row.optString("id").takeIf { it.isNotEmpty() }?.let { target.put("id", it) }
+            val incoming = row.optJSONObject("function") ?: continue
+            incoming.optString("name").takeIf { it.isNotEmpty() }?.let { fn.put("name", it) }
+            fn.put("arguments", fn.optString("arguments") + incoming.optString("arguments"))
+        }
+    }
+
+    /**
      * Streams the upstream answer through unchanged.
      *
      * The stream stays open for the whole generation, so it is forwarded frame
      * by frame — buffering it would stall the caller until the answer finished.
      */
-    private fun relay(output: OutputStream, result: UpstreamClient.ChatResult.Ok, model: String): SseUsage {
+    private fun relay(
+        output: OutputStream,
+        result: UpstreamClient.ChatResult.Ok,
+        model: String,
+        format: ApiFormat,
+    ): SseUsage {
         output.write(
             (
                 "HTTP/1.1 200 OK\r\n" +
@@ -286,10 +464,71 @@ class BridgeServer(
                 ).toByteArray(StandardCharsets.US_ASCII),
         )
         output.flush()
+
+        // Chat Completions is what the upstream already speaks, so those frames
+        // go out untouched. A translated dialect has to be read and re-emitted,
+        // which costs the byte-for-byte pass-through but keeps the stream
+        // incremental.
+        if (format == ApiFormat.OPENAI) return relayRaw(output, result)
+
+        val adapter = ApiStreamAdapter(format, model)
+        adapter.opening().forEach { output.write(it.toByteArray(StandardCharsets.UTF_8)) }
+        output.flush()
+
         val buffer = ByteArray(4096)
-        // The usage block arrives in a trailing SSE frame, so the stream is
-        // scanned as it is forwarded: the same bytes go to the client, and the
-        // last complete usage object seen is what the call gets billed for.
+        val tail = StringBuilder()
+        var carry = ""
+        var usage = SseUsage()
+        var finishReason: String? = null
+        try {
+            while (true) {
+                val read = result.stream.read(buffer)
+                if (read < 0) break
+                val chunk = String(buffer, 0, read, StandardCharsets.UTF_8)
+                tail.append(chunk)
+                if (tail.length > USAGE_SCAN_BYTES) {
+                    tail.delete(0, tail.length - USAGE_SCAN_BYTES)
+                }
+                usage = parseUsage(tail.toString()) ?: usage
+
+                // Frames arrive split across reads, so an incomplete line is
+                // held back until the rest of it shows up.
+                carry += chunk
+                val lines = carry.split("\n")
+                carry = lines.last()
+                for (line in lines.dropLast(1)) {
+                    val trimmed = line.trim()
+                    if (!trimmed.startsWith("data:")) continue
+                    val payload = trimmed.removePrefix("data:").trim()
+                    if (payload.isEmpty() || payload == "[DONE]") continue
+                    val frame = runCatching { JSONObject(payload) }.getOrNull() ?: continue
+                    val choice = frame.optJSONArray("choices")?.optJSONObject(0) ?: continue
+                    choice.optString("finish_reason").takeIf { it.isNotEmpty() }?.let { finishReason = it }
+                    val delta = choice.optJSONObject("delta") ?: continue
+                    adapter.onDelta(delta).forEach {
+                        output.write(it.toByteArray(StandardCharsets.UTF_8))
+                    }
+                    output.flush()
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "chat relay interrupted", e)
+        }
+        adapter.closing(finishReason, usage.prompt, usage.completion).forEach {
+            output.write(it.toByteArray(StandardCharsets.UTF_8))
+        }
+        output.flush()
+        return usage
+    }
+
+    /**
+     * Forwards the upstream stream unchanged.
+     *
+     * The bytes the client receives are the ones the upstream sent, so the only
+     * work here is scanning for the usage block that reports what was billed.
+     */
+    private fun relayRaw(output: OutputStream, result: UpstreamClient.ChatResult.Ok): SseUsage {
+        val buffer = ByteArray(4096)
         val tail = StringBuilder()
         var usage = SseUsage()
         try {

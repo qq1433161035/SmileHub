@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material.icons.filled.Delete
@@ -346,6 +347,7 @@ fun BridgeScreen(
     onToggleLan: (Boolean) -> Unit,
     onSaveLanKey: (String) -> Unit,
     onCopyField: (String, String) -> Unit,
+    onOpenAdvanced: () -> Unit,
     onToggleStealth: (Boolean) -> Unit,
     onDotColor: (Int) -> Unit,
     onDotSize: (Int) -> Unit,
@@ -375,6 +377,13 @@ fun BridgeScreen(
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.weight(1f),
                         )
+                        IconButton(onClick = onOpenAdvanced) {
+                            Icon(
+                                Icons.Default.Tune,
+                                contentDescription = "高级设置",
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                         Switch(checked = state.bridgeRunning, onCheckedChange = { checked ->
                             if (checked) onStart(portText.toIntOrNull() ?: 8765) else onStop()
                         })
@@ -1546,6 +1555,140 @@ private fun formatMultiplier(value: Double): String =
     } else {
         String.format(Locale.US, "%.2f", value)
     }
+
+/**
+ * Offers to rewrite the client's self-identification.
+ *
+ * Shown when the Anthropic dialect is switched on, because that is the point at
+ * which the user is most likely to be pointing Claude Code at this endpoint, and
+ * the upstream refuses that client's own identity string. The prompt states what
+ * is rewritten rather than doing it silently.
+ */
+@Composable
+fun DisguisePromptDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("需要伪装客户端身份吗？") },
+        text = {
+            Text(
+                "WorkBuddy 上游会主动拦截 Claude Code 的身份声明，" +
+                    "被拦截时请求会直接失败。\n\n" +
+                    "如果你使用的是 Claude Code，请开启伪装：" +
+                    "只改写那一句身份声明（去掉一个词），" +
+                    "模型的能力、你的提示词与工具定义都不受影响。\n\n" +
+                    "使用其它客户端时保持关闭即可。",
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("开启伪装") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("暂不开启") } },
+    )
+}
+
+/**
+ * Advanced settings for the endpoint.
+ *
+ * Kept behind a button rather than shown inline: these change how the endpoint
+ * behaves for clients, not what it serves, and most users never touch them.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BridgeAdvancedSheet(
+    state: HubState,
+    onDismiss: () -> Unit,
+    onToggleAggregate: (Boolean) -> Unit,
+    onToggleAnthropic: (Boolean) -> Unit,
+    onToggleResponses: (Boolean) -> Unit,
+    onToggleDisguise: (Boolean) -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 20.dp, end = 20.dp, bottom = 40.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                "高级设置",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("支持非流式请求", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "开启后，请求里 stream 为 false 或未指定的客户端会收到一个完整响应；" +
+                            "关闭时一律返回流式结果。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.aggregateNonStream, onCheckedChange = onToggleAggregate)
+            }
+
+            Text(
+                "上游只支持流式输出，因此非流式响应是在本机收齐后再返回的：" +
+                    "首字节会等到模型生成完毕，较长的回答在客户端看来会有一段等待。" +
+                    "不需要该功能的客户端保持关闭即可。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            HorizontalDivider()
+
+            Text(
+                "协议转换",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "上游只提供 OpenAI Chat Completions，开启后本机可以把它的请求与响应" +
+                    "翻译成下面这些协议，供使用对应协议的客户端接入。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Anthropic Messages API", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "提供 /v1/messages，供 Claude Code 等客户端使用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.formatAnthropic, onCheckedChange = onToggleAnthropic)
+            }
+
+            if (state.formatAnthropic) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("伪装客户端身份", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "上游会拦截 Claude Code 的身份声明，开启后该句会被改写，" +
+                                "其余内容不变。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = state.disguiseIdentity, onCheckedChange = onToggleDisguise)
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("OpenAI Responses API", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "提供 /v1/responses，供使用新版 Responses 协议的客户端使用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.formatResponses, onCheckedChange = onToggleResponses)
+            }
+        }
+    }
+}
 
 /**
  * Settings for the call history, shown as a bottom sheet from the calls page.

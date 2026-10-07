@@ -91,6 +91,13 @@ fun HubApp(
     onSaveKey: (String) -> Unit,
     onToggleLan: (Boolean) -> Unit,
     onSaveLanKey: (String) -> Unit,
+    onOpenBridgeAdvanced: () -> Unit,
+    onDismissBridgeAdvanced: () -> Unit,
+    onToggleAggregate: (Boolean) -> Unit,
+    onToggleAnthropic: (Boolean) -> Unit,
+    onToggleResponses: (Boolean) -> Unit,
+    onToggleDisguise: (Boolean) -> Unit,
+    onDismissDisguisePrompt: () -> Unit,
     onToggleStealth: (Boolean) -> Unit,
     onDotColor: (Int) -> Unit,
     onDotSize: (Int) -> Unit,
@@ -191,6 +198,7 @@ fun HubApp(
                             onSaveKey = onSaveKey,
                             onToggleLan = onToggleLan,
                             onCopyField = onCopyField,
+                            onOpenAdvanced = onOpenBridgeAdvanced,
                             onSaveLanKey = onSaveLanKey,
                             onToggleStealth = onToggleStealth,
                             onDotColor = onDotColor,
@@ -256,6 +264,22 @@ fun HubApp(
         }
         if (state.showModelStats) {
             ModelStatsSheet(state = state, onDismiss = onDismissModelStats)
+        }
+        if (state.showBridgeAdvanced) {
+            BridgeAdvancedSheet(
+                state = state,
+                onDismiss = onDismissBridgeAdvanced,
+                onToggleAggregate = onToggleAggregate,
+                onToggleAnthropic = onToggleAnthropic,
+                onToggleResponses = onToggleResponses,
+                onToggleDisguise = onToggleDisguise,
+            )
+        }
+        if (state.showDisguisePrompt) {
+            DisguisePromptDialog(
+                onConfirm = { onToggleDisguise(true) },
+                onDismiss = onDismissDisguisePrompt,
+            )
         }
         if (state.showCallSettings) {
             CallSettingsSheet(

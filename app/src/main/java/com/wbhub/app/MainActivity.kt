@@ -163,6 +163,10 @@ class MainActivity : ComponentActivity() {
             secret = BridgeSettings.apiKey(this),
             lanKey = BridgeSettings.lanKey(this),
             lanEnabled = lanOn,
+            aggregateNonStream = BridgeSettings.aggregateNonStream(this),
+            formatAnthropic = BridgeSettings.formatAnthropic(this),
+            formatResponses = BridgeSettings.formatResponses(this),
+            disguiseIdentity = BridgeSettings.disguiseIdentity(this),
             lanAddresses = if (lanOn) LanAddresses.current() else emptyList(),
             stealthEnabled = BridgeSettings.stealthEnabled(this),
             dotColor = BridgeSettings.dotColor(this),
@@ -256,6 +260,36 @@ class MainActivity : ComponentActivity() {
                         lanEnabled = enabled,
                         lanAddresses = if (enabled) LanAddresses.current() else emptyList(),
                     )
+                    service?.restartBridge()
+                },
+                onOpenBridgeAdvanced = { state = state.copy(showBridgeAdvanced = true) },
+                onDismissBridgeAdvanced = { state = state.copy(showBridgeAdvanced = false) },
+                onToggleAggregate = { enabled ->
+                    BridgeSettings.setAggregateNonStream(this, enabled)
+                    state = state.copy(aggregateNonStream = enabled)
+                    // The listener reads the flag at start, so it is rebuilt.
+                    service?.restartBridge()
+                },
+                onToggleAnthropic = { enabled ->
+                    BridgeSettings.setFormatAnthropic(this, enabled)
+                    state = state.copy(formatAnthropic = enabled)
+                    // Turning it on is the moment the user is likely to be using
+                    // Claude Code, which is the client the upstream refuses; the
+                    // offer is made here rather than buried in the settings.
+                    if (enabled && !BridgeSettings.disguiseIdentity(this)) {
+                        state = state.copy(showDisguisePrompt = true)
+                    }
+                    service?.restartBridge()
+                },
+                onToggleDisguise = { enabled ->
+                    BridgeSettings.setDisguiseIdentity(this, enabled)
+                    state = state.copy(disguiseIdentity = enabled, showDisguisePrompt = false)
+                    service?.restartBridge()
+                },
+                onDismissDisguisePrompt = { state = state.copy(showDisguisePrompt = false) },
+                onToggleResponses = { enabled ->
+                    BridgeSettings.setFormatResponses(this, enabled)
+                    state = state.copy(formatResponses = enabled)
                     service?.restartBridge()
                 },
                 onSaveLanKey = { key ->
