@@ -250,11 +250,17 @@ class BridgeServer(
             sendJson(output, 401, """{"error":{"message":"no credential","type":"not_signed_in"}}""")
             return
         }
-        if (runCatching { JSONObject(body) }.isFailure) {
+        // Parsed once and kept as an object from here on. Every later stage —
+        // the dialect conversion, the shaping the gateway needs, the disguise —
+        // edits this same object, so a request is never serialised only to be
+        // parsed again. On the multi-megabyte bodies a coding client sends,
+        // those round trips are the largest cost the endpoint imposes before
+        // the upstream has seen anything.
+        val request = runCatching { JSONObject(body) }.getOrNull()
+        if (request == null) {
             sendJson(output, 400, """{"error":{"message":"invalid json"}}""")
             return
         }
-        val request = runCatching { JSONObject(body) }.getOrNull() ?: JSONObject()
         val model = request.optString("model")
         // Read before the body is rewritten: prepareChatBody forces stream:true
         // for the upstream, which would lose what the client actually asked for.
@@ -269,9 +275,9 @@ class BridgeServer(
         // on; otherwise the stream is passed through as before, which is what a
         // client parsing SSE expects anyway.
         val serveWholeResponse = !wantsStream && aggregateNonStream
-        val upstreamBody = ApiAdapters.toChatBody(request, format, disguiseIdentity).toString()
         val started = System.currentTimeMillis()
-        when (val result = client.chatStream(cred, upstreamBody)) {
+        val upstreamRequest = ApiAdapters.toChatBody(request, format, disguiseIdentity)
+        when (val result = client.chatStream(cred, upstreamRequest)) {
             is UpstreamClient.ChatResult.Failed -> {
                 val detail = Wire.displayError(result.message) ?: result.message.take(200)
                 BridgeStatus.recordError("${result.kind.name.lowercase()}: $detail")

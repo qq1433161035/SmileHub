@@ -105,10 +105,22 @@ object Wire {
      */
     fun prepareChatBody(source: String): String {
         val obj = runCatching { JSONObject(source) }.getOrNull() ?: return source
+        return prepareChatBodyObject(obj).toString()
+    }
+
+    /**
+     * The same shaping, on a body that is already parsed.
+     *
+     * The bridge holds a request as an object, so handing it to the string
+     * entry point would serialise it only to parse it straight back — a copy of
+     * several megabytes, paid on every call and sitting in front of the first
+     * token the client is waiting for.
+     */
+    fun prepareChatBodyObject(obj: JSONObject): JSONObject {
         obj.put("stream", true)
         normalizeDeveloperRole(obj)
         normalizeToolChoice(obj)
-        return obj.toString()
+        return obj
     }
 
     private fun normalizeDeveloperRole(obj: JSONObject) {
@@ -156,17 +168,26 @@ object Wire {
      * message and rejects the adapter's `off` effort spelling.
      */
     fun prepareInternationalChatBody(source: String): String {
-        val prepared = prepareChatBody(source)
-        val obj = runCatching { JSONObject(prepared) }.getOrNull() ?: return prepared
+        val obj = runCatching { JSONObject(source) }.getOrNull() ?: return source
+        return prepareInternationalChatBodyObject(obj).toString()
+    }
+
+    /**
+     * The international shaping, on a body that is already parsed.
+     *
+     * See [prepareChatBodyObject] for why the object form exists.
+     */
+    fun prepareInternationalChatBodyObject(obj: JSONObject): JSONObject {
+        prepareChatBodyObject(obj)
         if (obj.optString("reasoning_effort") == "off") obj.remove("reasoning_effort")
-        val messages = obj.optJSONArray("messages") ?: return obj.toString()
+        val messages = obj.optJSONArray("messages") ?: return obj
         val first = messages.optJSONObject(0)
-        if (first != null && first.optString("role") == "system") return obj.toString()
+        if (first != null && first.optString("role") == "system") return obj
         val rebuilt = JSONArray()
         rebuilt.put(JSONObject().put("role", "system").put("content", INTERNATIONAL_SYSTEM_PROMPT))
         for (i in 0 until messages.length()) rebuilt.put(messages.opt(i))
         obj.put("messages", rebuilt)
-        return obj.toString()
+        return obj
     }
 
     private const val INTERNATIONAL_SYSTEM_PROMPT = "You are a helpful assistant."

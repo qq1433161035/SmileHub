@@ -1,5 +1,7 @@
 package com.wbhub.app.agent
 
+import com.wbhub.app.proto.Gzip
+
 import android.util.Log
 import com.wbhub.app.proto.ChatIdentity
 import com.wbhub.app.proto.Credential
@@ -139,9 +141,13 @@ class AgentClient {
         val body = buildBody(transcript, modelId, effort, contextWindow, tools, credential)
         val region = credential.region
         val identity = ChatIdentity.forRegion(region)
-        val conn = open(
-            "${Wire.chatBase(region)}/v2/chat/completions",
-            Wire.chatHeaders(
+        // Compressed for the same reason the bridge does it: the transcript is
+        // resent whole on every turn, so it is mostly repetition, and the upload
+        // is the largest cost the device pays before the model starts answering.
+        // A gateway that will not take it is retried in the clear, and then
+        // remembered, so both paths behave the same way.
+        val attempt = Gzip.postChat(region, body) { bytes, compressed ->
+            val headers = Wire.chatHeaders(
                 region = region,
                 accessToken = credential.accessToken,
                 uid = credential.uid,
@@ -149,16 +155,26 @@ class AgentClient {
                 enterpriseId = credential.enterpriseId,
                 userAgent = identity.userAgent,
                 clientVersion = identity.clientVersion,
-            ),
-            body,
-        )
-
-        val status = conn.responseCode
-        if (status !in 200..299) {
-            val text = conn.errorStream?.readBytes()?.toString(StandardCharsets.UTF_8).orEmpty()
+            ).toMutableMap()
+            if (compressed) headers["Content-Encoding"] = "gzip"
+            val opened = open(
+                "${Wire.chatBase(region)}/v2/chat/completions",
+                headers,
+                bytes,
+            )
+            // Read once, here: the error stream cannot be re-read by whoever
+            // reports the failure, and the retry decision needs the same text.
+            val status = runCatching { opened.responseCode }.getOrDefault(0)
+            val error = if (status in 200..299) "" else runCatching {
+                opened.errorStream?.readBytes()?.toString(StandardCharsets.UTF_8).orEmpty()
+            }.getOrDefault("")
+            Gzip.Attempt(opened, status, error)
+        }
+        val conn = attempt.value
+        if (!attempt.accepted) {
             conn.disconnect()
-            val detail = Wire.displayError(text) ?: text.take(200)
-            throw IllegalStateException("上游返回 $status：$detail")
+            val detail = Wire.displayError(attempt.errorBody) ?: attempt.errorBody.take(200)
+            throw IllegalStateException("上游返回 ${attempt.status}：$detail")
         }
 
         val text = StringBuilder()
@@ -336,7 +352,7 @@ class AgentClient {
         return result
     }
 
-    private fun open(url: String, headers: Map<String, String>, body: String): HttpURLConnection =
+    private fun open(url: String, headers: Map<String, String>, body: ByteArray): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 20_000
@@ -345,7 +361,7 @@ class AgentClient {
             readTimeout = 0
             headers.forEach { (k, v) -> setRequestProperty(k, v) }
             doOutput = true
-            outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+            outputStream.use { it.write(body) }
         }
 
     companion object {

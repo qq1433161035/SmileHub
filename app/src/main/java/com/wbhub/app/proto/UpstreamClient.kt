@@ -34,42 +34,80 @@ class UpstreamClient {
      * disconnect it; failures carry the classification the bridge maps to a
      * status code.
      */
-    fun chatStream(credential: Credential, bodyJson: String, userAgentOverride: String? = null): ChatResult {
+    fun chatStream(credential: Credential, request: JSONObject, userAgentOverride: String? = null): ChatResult {
         val region = credential.region
+        // The caller already holds the request as an object, so the shaping is
+        // applied in place. Routing it through a string here would parse and
+        // re-serialise a multi-megabyte body for nothing, and that copy is
+        // time the client spends waiting for its first token.
         val body = if (region == Wire.Region.GLOBAL) {
-            Wire.prepareInternationalChatBody(bodyJson)
+            Wire.prepareInternationalChatBodyObject(request)
         } else {
-            Wire.prepareChatBody(bodyJson)
-        }
+            Wire.prepareChatBodyObject(request)
+        }.toString()
         val identity = ChatIdentity.forRegion(region)
         val userAgent = userAgentOverride ?: identity.userAgent
+        // Compression, and the recovery when a gateway will not take it, are
+        // handled in one place so the endpoint and the built-in chat cannot
+        // drift apart on how they reach the same gateway.
+        val attempt = Gzip.postChat(region, body) { bytes, compressed ->
+            attemptChat(region, credential, identity, userAgent, bytes, compressed)
+        }
+        return attempt.value
+    }
+
+    /**
+     * One try at the chat endpoint with the given encoded body.
+     *
+     * The status and any failure body are read here, once, because the error
+     * stream cannot be read twice and both the retry decision and the reported
+     * error need them.
+     */
+    private fun attemptChat(
+        region: Wire.Region,
+        credential: Credential,
+        identity: ChatIdentity,
+        userAgent: String,
+        body: ByteArray,
+        compressed: Boolean,
+    ): Gzip.Attempt<ChatResult> {
+        val headers = Wire.chatHeaders(
+            region = region,
+            accessToken = credential.accessToken,
+            uid = credential.uid,
+            domain = credential.domain,
+            enterpriseId = credential.enterpriseId,
+            userAgent = userAgent,
+            clientVersion = identity.clientVersion,
+        ).toMutableMap()
+        // Declared only when the body really is compressed, which a body below
+        // the threshold is not.
+        if (compressed) headers["Content-Encoding"] = "gzip"
         val conn = open(
             "${Wire.chatBase(region)}/v2/chat/completions",
             "POST",
-            Wire.chatHeaders(
-                region = region,
-                accessToken = credential.accessToken,
-                uid = credential.uid,
-                domain = credential.domain,
-                enterpriseId = credential.enterpriseId,
-                userAgent = userAgent,
-                clientVersion = identity.clientVersion,
-            ),
+            headers,
             body,
             readTimeoutMs = 0,
-        ) ?: return ChatResult.Failed(0, Wire.ErrorKind.SERVER, "transport error")
+        ) ?: return Gzip.Attempt(
+            ChatResult.Failed(0, Wire.ErrorKind.SERVER, "transport error"),
+            0,
+        )
 
         val status = runCatching { conn.responseCode }.getOrElse {
             conn.disconnect()
-            return ChatResult.Failed(0, Wire.ErrorKind.SERVER, "transport error: ${it.message}")
+            return Gzip.Attempt(
+                ChatResult.Failed(0, Wire.ErrorKind.SERVER, "transport error: ${it.message}"),
+                0,
+            )
         }
         if (status in 200..299) {
-            return ChatResult.Ok(conn, conn.inputStream)
+            return Gzip.Attempt(ChatResult.Ok(conn, conn.inputStream), status)
         }
         val text = runCatching { conn.errorStream?.readBytes()?.toString(StandardCharsets.UTF_8).orEmpty() }
             .getOrDefault("").take(Wire.ERROR_BODY_LIMIT)
         conn.disconnect()
-        return ChatResult.Failed(status, Wire.classify(status, text), text)
+        return Gzip.Attempt(ChatResult.Failed(status, Wire.classify(status, text), text), status, text)
     }
 
     /** Exchanges a refresh token for a fresh access token. Throws when refused. */
@@ -261,7 +299,7 @@ class UpstreamClient {
         url: String,
         method: String,
         headers: Map<String, String>,
-        body: String?,
+        body: ByteArray?,
         readTimeoutMs: Int = Wire.JSON_TIMEOUT_MS,
     ): HttpURLConnection? = runCatching {
         (URL(url).openConnection() as HttpURLConnection).apply {
@@ -271,14 +309,14 @@ class UpstreamClient {
             headers.forEach { (k, v) -> setRequestProperty(k, v) }
             if (body != null) {
                 doOutput = true
-                outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
+                outputStream.use { it.write(body) }
             }
         }
     }.onFailure { Log.e(TAG, "connect failed: $url", it) }.getOrNull()
 
     /** Sends a JSON request and returns the body, including non-2xx bodies. */
     private fun request(url: String, method: String, headers: Map<String, String>, body: String?): String {
-        val conn = open(url, method, headers, body)
+        val conn = open(url, method, headers, body?.toByteArray(StandardCharsets.UTF_8))
             ?: throw IllegalStateException("transport error connecting to $url")
         return try {
             val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
