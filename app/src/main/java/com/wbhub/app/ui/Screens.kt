@@ -1660,13 +1660,13 @@ fun BridgeAdvancedSheet(
                 Switch(checked = state.formatAnthropic, onCheckedChange = onToggleAnthropic)
             }
 
-            if (state.formatAnthropic) {
+            if (state.formatAnthropic || state.formatResponses) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("伪装客户端身份", style = MaterialTheme.typography.bodyMedium)
                         Text(
-                            "上游会拦截 Claude Code 的身份声明，开启后该句会被改写，" +
-                                "其余内容不变。",
+                            "上游会拦截 Claude Code 与 Codex 等客户端的身份声明，" +
+                                "开启后这些句子会被改写，其余内容不变。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

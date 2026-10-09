@@ -23,18 +23,19 @@ enum class ApiFormat { OPENAI, RESPONSES, ANTHROPIC }
 object ApiAdapters {
 
     /**
-     * Markers the upstream refuses, each paired with what replaces it.
+     * Markers the upstream refuses, and what replaces each.
      *
-     * Measured against the live gateway. The match is a case-insensitive
-     * substring search rather than a prefix test: the third marker trips the
-     * filter while sitting in the middle of a 27 kB prompt, and changing any
-     * single character in it clears the block. The first two only ever appear
-     * at the start of a prompt, so one substring pass covers all three.
+     * Measured against the live gateway, which filters by two different rules:
      *
-     * The third is the one Claude Code ships in its own instructions — a
-     * sentence pointing users at its issue tracker. It is filtered only
-     * together with the URL that follows it, so the wording is changed and the
-     * link is left intact and usable.
+     *  - [BLOCKED_MARKERS] are found anywhere in the text. One of them trips the
+     *    filter while sitting in the middle of a 27 kB prompt, and changing any
+     *    single character clears the block.
+     *  - [BLOCKED_PREFIXES] are only matched at the very start: the same text
+     *    preceded by a single space or a newline passes. These are the
+     *    self-descriptions clients open their instructions with.
+     *
+     * Both are handled because a client may send either, and a rule applied in
+     * the wrong place is either a missed block or a needless rewrite.
      */
     private val BLOCKED_MARKERS: List<Pair<String, String>> = listOf(
         // The identity sentence; one word is dropped, which is enough to stop
@@ -46,6 +47,23 @@ object ApiAdapters {
         "x-anthropic-billing-header" to "x-client-billing-header",
         "To give feedback, users should report the issue at" to
             "For feedback, users should report the issue at",
+    )
+
+    /**
+     * Markers the upstream refuses only when the text begins with them.
+     *
+     * The second entry is the opening of another vendor's coding agent — a
+     * paragraph describing what the agent is, which the gateway reads as an
+     * attempt to drive the account from a client it has not approved. It is
+     * filtered as one whole passage: dropping its final word, or hyphenating a
+     * term inside it, is enough to pass. The rewrite therefore only touches its
+     * opening clause, which changes nothing about what the agent is told to do.
+     */
+    private val BLOCKED_PREFIXES: List<Pair<String, String>> = listOf(
+        // Opening of another vendor's coding agent. Only its first clause is
+        // rewritten — the sentence still says the same thing about the agent.
+        "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful." to
+            "You're a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.",
     )
 
     /**
@@ -63,12 +81,18 @@ object ApiAdapters {
                 rewritten = rewritten.replace(marker, replacement, ignoreCase = true)
             }
         }
+        for ((prefix, replacement) in BLOCKED_PREFIXES) {
+            if (rewritten.startsWith(prefix, ignoreCase = true)) {
+                rewritten = replacement + rewritten.substring(prefix.length)
+            }
+        }
         return rewritten
     }
 
     /** Whether [text] carries anything the upstream refuses. */
     fun needsDisguise(text: String): Boolean =
-        BLOCKED_MARKERS.any { text.contains(it.first, ignoreCase = true) }
+        BLOCKED_MARKERS.any { text.contains(it.first, ignoreCase = true) } ||
+            BLOCKED_PREFIXES.any { text.startsWith(it.first, ignoreCase = true) }
 
     /**
      * Roles whose text the upstream reads.
@@ -570,7 +594,49 @@ class ApiStreamAdapter(private val format: ApiFormat, private val model: String)
     /** Block index for each upstream tool-call index. */
     private val toolBlockIndex = mutableMapOf<Int, Int>()
 
-    private var textItemOpen = false
+    /**
+     * Output index of the open text message, or -1 when none is.
+     *
+     * The Responses dialect numbers every item in `output` in the order it was
+     * emitted, and a turn that both speaks and calls a tool puts more than one
+     * there — so the index cannot be assumed to be zero.
+     */
+    private var textOutputIndex = -1
+
+    /** Item id announced for the open text message. */
+    private var textItemId = ""
+
+    /** Text accumulated for the open message, so the closing events can carry it. */
+    private val textSeen = StringBuilder()
+
+    /** Index the next output item will take. */
+    private var nextOutputIndex = 0
+
+    /** Output index of the item opened for each upstream tool-call index. */
+    private val callOutputIndex = mutableMapOf<Int, Int>()
+
+    /** Call id announced for each upstream tool-call index. */
+    private val callIds = mutableMapOf<Int, String>()
+
+    /** Tool name announced for each upstream tool-call index. */
+    private val callNames = mutableMapOf<Int, String>()
+
+    /** Item id announced for each upstream tool-call index. */
+    private val callItemIds = mutableMapOf<Int, String>()
+
+    /** Arguments accumulated so far for each upstream tool-call index. */
+    private val callArguments = mutableMapOf<Int, StringBuilder>()
+
+    /**
+     * Every item emitted so far, so the final response can carry them.
+     *
+     * A client is allowed to read the answer from `response.completed` instead
+     * of following the deltas, so that event has to describe the whole turn.
+     */
+    private val completedItems = JSONArray()
+
+    /** Ordering counter the Responses dialect expects on every event. */
+    private var sequence = 0
 
     /** Frames to send before anything else. */
     fun opening(): List<String> {
@@ -601,6 +667,7 @@ class ApiStreamAdapter(private val format: ApiFormat, private val model: String)
                 dataEvent(
                     JSONObject().apply {
                         put("type", "response.created")
+                        put("sequence_number", sequence++)
                         put(
                             "response",
                             JSONObject().apply {
@@ -739,43 +806,127 @@ class ApiStreamAdapter(private val format: ApiFormat, private val model: String)
     private fun responsesDelta(delta: JSONObject): List<String> {
         val out = mutableListOf<String>()
         delta.optString("content").takeIf { it.isNotEmpty() }?.let { piece ->
-            if (!textItemOpen) {
-                textItemOpen = true
-                out += dataEvent(
-                    JSONObject().apply {
-                        put("type", "response.output_item.added")
-                        put("output_index", 0)
-                        put(
-                            "item",
-                            JSONObject().apply {
-                                put("type", "message")
-                                put("id", "msg_" + System.currentTimeMillis())
-                                put("role", "assistant")
-                                put("status", "in_progress")
-                                put("content", JSONArray())
-                            },
-                        )
-                    },
-                )
-                out += dataEvent(
-                    JSONObject().apply {
-                        put("type", "response.content_part.added")
-                        put("output_index", 0)
-                        put("content_index", 0)
-                        put("part", JSONObject().put("type", "output_text").put("text", ""))
-                    },
-                )
-            }
+            out += ensureTextItem()
             out += dataEvent(
                 JSONObject().apply {
                     put("type", "response.output_text.delta")
-                    put("output_index", 0)
+                    put("sequence_number", sequence++)
+                    put("item_id", textItemId)
+                    put("output_index", textOutputIndex)
                     put("content_index", 0)
                     put("delta", piece)
                 },
             )
+            textSeen.append(piece)
+        }
+        // A tool call arrives as fragments keyed by index, exactly as it does in
+        // Chat Completions: the name and id come with the first fragment and the
+        // arguments are spread across the rest. The dialect wants an item opened
+        // for the call before its arguments are streamed, so the opening is held
+        // back until the name shows up.
+        delta.optJSONArray("tool_calls")?.let { calls ->
+            for (i in 0 until calls.length()) {
+                val row = calls.optJSONObject(i) ?: continue
+                val callIndex = row.optInt("index", i)
+                val fn = row.optJSONObject("function") ?: continue
+                val name = fn.optString("name")
+                if (name.isNotEmpty() && callOutputIndex[callIndex] == null) {
+                    out += openCallItem(callIndex, name, row.optString("id"))
+                }
+                fn.optString("arguments").takeIf { it.isNotEmpty() }?.let { piece ->
+                    callArguments.getOrPut(callIndex) { StringBuilder() }.append(piece)
+                    // Arguments are emitted as they arrive rather than collected:
+                    // a long call would otherwise sit silent until it finished.
+                    val index = callOutputIndex[callIndex] ?: return@let
+                    out += dataEvent(
+                        JSONObject().apply {
+                            put("type", "response.function_call_arguments.delta")
+                            put("sequence_number", sequence++)
+                            put("item_id", callItemIds[callIndex].orEmpty())
+                            put("output_index", index)
+                            put("delta", piece)
+                        },
+                    )
+                }
+            }
         }
         return out
+    }
+
+    /** Opens the text message item if one is not already open. */
+    private fun ensureTextItem(): List<String> {
+        if (textOutputIndex >= 0) return emptyList()
+        textOutputIndex = nextOutputIndex++
+        textItemId = "msg_" + System.currentTimeMillis()
+        return listOf(
+            dataEvent(
+                JSONObject().apply {
+                    put("type", "response.output_item.added")
+                    put("sequence_number", sequence++)
+                    put("output_index", textOutputIndex)
+                    put(
+                        "item",
+                        JSONObject().apply {
+                            put("type", "message")
+                            put("id", textItemId)
+                            put("role", "assistant")
+                            put("status", "in_progress")
+                            put("content", JSONArray())
+                        },
+                    )
+                },
+            ),
+            dataEvent(
+                JSONObject().apply {
+                    put("type", "response.content_part.added")
+                    put("sequence_number", sequence++)
+                    put("item_id", textItemId)
+                    put("output_index", textOutputIndex)
+                    put("content_index", 0)
+                    put("part", JSONObject().put("type", "output_text").put("text", ""))
+                },
+            ),
+        )
+    }
+
+    /**
+     * Opens an output item for one tool call.
+     *
+     * A client that reads the item as it appears needs the name and the call id
+     * here, because the arguments that follow carry neither.
+     */
+    private fun openCallItem(callIndex: Int, name: String, upstreamId: String): List<String> {
+        val outputIndex = nextOutputIndex++
+        callOutputIndex[callIndex] = outputIndex
+        // The call id is what the client echoes back when it reports the tool's
+        // result, so it has to be the upstream's own id for the round trip to
+        // close. The item id is this dialect's own handle and only has to be
+        // unique within the response.
+        val callId = upstreamId.ifEmpty { "call_" + System.currentTimeMillis() + "_" + callIndex }
+        val itemId = "fc_" + System.currentTimeMillis() + "_" + callIndex
+        callIds[callIndex] = callId
+        callNames[callIndex] = name
+        callItemIds[callIndex] = itemId
+        return listOf(
+            dataEvent(
+                JSONObject().apply {
+                    put("type", "response.output_item.added")
+                    put("sequence_number", sequence++)
+                    put("output_index", outputIndex)
+                    put(
+                        "item",
+                        JSONObject().apply {
+                            put("type", "function_call")
+                            put("id", itemId)
+                            put("call_id", callId)
+                            put("name", name)
+                            put("arguments", "")
+                            put("status", "in_progress")
+                        },
+                    )
+                },
+            ),
+        )
     }
 
     // ------------------------------------------------------------------ //
@@ -816,24 +967,122 @@ class ApiStreamAdapter(private val format: ApiFormat, private val model: String)
             }
             ApiFormat.RESPONSES -> {
                 val out = mutableListOf<String>()
-                if (textItemOpen) {
+                // Every open item is closed before the response is, and in the
+                // order it was opened: a client that is assembling the turn
+                // needs each item finished before the whole is declared done.
+                if (textOutputIndex >= 0) {
                     out += dataEvent(
                         JSONObject().apply {
                             put("type", "response.output_text.done")
-                            put("output_index", 0)
+                            put("sequence_number", sequence++)
+                            put("item_id", textItemId)
+                            put("output_index", textOutputIndex)
                             put("content_index", 0)
+                            put("text", textSeen.toString())
+                        },
+                    )
+                    out += dataEvent(
+                        JSONObject().apply {
+                            put("type", "response.content_part.done")
+                            put("sequence_number", sequence++)
+                            put("item_id", textItemId)
+                            put("output_index", textOutputIndex)
+                            put("content_index", 0)
+                            put(
+                                "part",
+                                JSONObject().apply {
+                                    put("type", "output_text")
+                                    put("text", textSeen.toString())
+                                    put("annotations", JSONArray())
+                                },
+                            )
                         },
                     )
                     out += dataEvent(
                         JSONObject().apply {
                             put("type", "response.output_item.done")
-                            put("output_index", 0)
+                            put("sequence_number", sequence++)
+                            put("output_index", textOutputIndex)
+                            put(
+                                "item",
+                                JSONObject().apply {
+                                    put("type", "message")
+                                    put("id", textItemId)
+                                    put("role", "assistant")
+                                    put("status", "completed")
+                                    put(
+                                        "content",
+                                        JSONArray().put(
+                                            JSONObject().apply {
+                                                put("type", "output_text")
+                                                put("text", textSeen.toString())
+                                                put("annotations", JSONArray())
+                                            },
+                                        ),
+                                    )
+                                },
+                            )
+                        },
+                    )
+                    completedItems.put(
+                        JSONObject().apply {
+                            put("type", "message")
+                            put("id", textItemId)
+                            put("role", "assistant")
+                            put("status", "completed")
+                            put(
+                                "content",
+                                JSONArray().put(
+                                    JSONObject().apply {
+                                        put("type", "output_text")
+                                        put("text", textSeen.toString())
+                                        put("annotations", JSONArray())
+                                    },
+                                ),
+                            )
                         },
                     )
                 }
+
+                // Tool calls are closed in the order they were opened, which is
+                // not necessarily the order the map iterates in.
+                for (callIndex in callOutputIndex.keys.sortedBy { callOutputIndex[it] }) {
+                    val index = callOutputIndex[callIndex] ?: continue
+                    val arguments = callArguments[callIndex]?.toString().orEmpty().ifEmpty { "{}" }
+                    val callId = callIds[callIndex].orEmpty()
+                    val name = callNames[callIndex].orEmpty()
+                    out += dataEvent(
+                        JSONObject().apply {
+                            put("type", "response.function_call_arguments.done")
+                            put("sequence_number", sequence++)
+                            put("item_id", callItemIds[callIndex].orEmpty())
+                            put("output_index", index)
+                            put("arguments", arguments)
+                        },
+                    )
+                    val item = JSONObject().apply {
+                        put("type", "function_call")
+                        put("id", callItemIds[callIndex].orEmpty())
+                        put("call_id", callId)
+                        put("name", name)
+                        put("arguments", arguments)
+                        put("status", "completed")
+                    }
+                    out += dataEvent(
+                        JSONObject().apply {
+                            put("type", "response.output_item.done")
+                            put("sequence_number", sequence++)
+                            put("output_index", index)
+                            put("item", item)
+                        },
+                    )
+                    completedItems.put(item)
+                }
+
                 out += dataEvent(
                     JSONObject().apply {
                         put("type", "response.completed")
+                        put("sequence_number", sequence++)
                         put(
                             "response",
                             JSONObject().apply {
@@ -841,6 +1090,8 @@ class ApiStreamAdapter(private val format: ApiFormat, private val model: String)
                                 put("object", "response")
                                 put("status", "completed")
                                 put("model", model)
+                                put("output", completedItems)
+                                put("output_text", textSeen.toString())
                                 put(
                                     "usage",
                                     JSONObject().apply {

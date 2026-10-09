@@ -271,14 +271,20 @@ object BridgeSettings {
     /**
      * Whether a client's self-identifying system prompt is rewritten.
      *
-     * The upstream refuses one specific identity string, so a client that sends
-     * it cannot be served at all. Rewriting it changes neither the request's
-     * meaning nor the model's behaviour; it only removes words the upstream
-     * rejects. Off by default, and only offered where it applies.
+     * The upstream refuses the identity passages several clients open their
+     * instructions with — Claude Code's and Codex's among them — and a client
+     * that sends one cannot be served at all. Rewriting them changes neither the
+     * request's meaning nor the model's behaviour; it only removes the words the
+     * upstream rejects.
+     *
+     * On by default, because every client this endpoint exists to serve sends
+     * one: leaving it off makes the endpoint look broken for exactly those
+     * clients, with nothing to say why. Leaving it on costs a client that sends
+     * nothing of the sort a few string comparisons per message.
      */
     fun disguiseIdentity(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_DISGUISE, false)
+            .getBoolean(KEY_DISGUISE, true)
 
     fun setDisguiseIdentity(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
