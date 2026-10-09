@@ -205,12 +205,26 @@ object ApiAdapters {
      */
     private fun appendAnthropicBlocks(sink: JSONArray, role: String, blocks: JSONArray) {
         val text = StringBuilder()
+        // Parts in the order they arrived, so text and images keep the positions
+        // the client put them in.
+        val parts = JSONArray()
+        var sawImage = false
         val toolCalls = JSONArray()
         val toolResults = mutableListOf<JSONObject>()
         for (i in 0 until blocks.length()) {
             val block = blocks.optJSONObject(i) ?: continue
             when (block.optString("type")) {
-                "text" -> text.append(block.optString("text"))
+                "text" -> {
+                    val piece = block.optString("text")
+                    text.append(piece)
+                    parts.put(JSONObject().put("type", "text").put("text", piece))
+                }
+                // An image is passed through as a URL, which is the one shape
+                // both dialects agree on; only the part's name differs.
+                "image" -> anthropicImagePart(block)?.let {
+                    sawImage = true
+                    parts.put(it)
+                }
                 "tool_use" -> toolCalls.put(
                     JSONObject().apply {
                         put("id", block.optString("id"))
@@ -242,10 +256,39 @@ object ApiAdapters {
                     put("tool_calls", toolCalls)
                 },
             )
+        } else if (sawImage) {
+            // Only a message that actually has an image needs the part list;
+            // everything else keeps the plain string it came as.
+            sink.put(JSONObject().put("role", role).put("content", parts))
         } else if (text.isNotEmpty()) {
             sink.put(JSONObject().put("role", role).put("content", text.toString()))
         }
         toolResults.forEach { sink.put(it) }
+    }
+
+    /**
+     * Rewrites one Anthropic image block as a Chat Completions image part.
+     *
+     * Anthropic sends the bytes inline as `{source:{type:base64,media_type,data}}`,
+     * which is the same information a data URL carries, so it is rebuilt as one
+     * rather than kept as a dialect-specific shape.
+     */
+    private fun anthropicImagePart(block: JSONObject): JSONObject? {
+        val source = block.optJSONObject("source") ?: return null
+        val url = when (source.optString("type")) {
+            "base64" -> {
+                val media = source.optString("media_type").ifEmpty { "image/png" }
+                val data = source.optString("data")
+                if (data.isEmpty()) return null
+                "data:$media;base64,$data"
+            }
+            "url" -> source.optString("url").ifEmpty { return null }
+            else -> return null
+        }
+        return JSONObject().apply {
+            put("type", "image_url")
+            put("image_url", JSONObject().put("url", url))
+        }
     }
 
     /** Anthropic tool schemas are `{name, input_schema}`; Chat wants them nested. */
@@ -314,8 +357,12 @@ object ApiAdapters {
                         )
                         else -> {
                             val role = item.optString("role").ifEmpty { "user" }
-                            val content = flattenContent(item.opt("content"))
-                            if (role == "assistant" && content.isEmpty()) continue
+                            // Content is passed through part by part rather than
+                            // flattened: this dialect carries images as their own
+                            // part, and flattening would leave only the words
+                            // around them.
+                            val content = responsesContent(item.opt("content"))
+                            if (role == "assistant" && isEmptyContent(content)) continue
                             messages.put(JSONObject().put("role", role).put("content", content))
                         }
                     }
@@ -535,6 +582,71 @@ object ApiAdapters {
     /** Parses a tool-call argument string, tolerating a malformed payload. */
     fun parseArguments(raw: String): JSONObject =
         runCatching { JSONObject(raw.trim().ifEmpty { "{}" }) }.getOrElse { JSONObject() }
+
+    /**
+     * Translates a Responses content value into the Chat Completions shape.
+     *
+     * A plain string stays a string, because that is what most turns are and
+     * rewriting them into a one-element list would change the request for no
+     * reason. A list is mapped part by part so images survive: the two dialects
+     * agree on text, and an image is a URL either way, so only the part's name
+     * has to be changed.
+     */
+    private fun responsesContent(value: Any?): Any = when (value) {
+        is String -> value
+        is JSONArray -> {
+            val out = JSONArray()
+            for (i in 0 until value.length()) {
+                val part = value.optJSONObject(i) ?: continue
+                when (part.optString("type")) {
+                    "input_text", "output_text", "text" ->
+                        out.put(JSONObject().put("type", "text").put("text", part.optString("text")))
+                    "input_image" -> chatImagePart(part)?.let { out.put(it) }
+                    // A tool result may wrap its own content list.
+                    else -> if (part.has("content")) {
+                        out.put(
+                            JSONObject().put("type", "text")
+                                .put("text", flattenContent(part.opt("content"))),
+                        )
+                    }
+                }
+            }
+            out
+        }
+        else -> flattenContent(value)
+    }
+
+    /**
+     * Rewrites one image part, or null when it carries nothing usable.
+     *
+     * Chat Completions wants the URL nested under `image_url`; the Responses
+     * dialect puts it directly on the part. The detail hint is carried across
+     * because it changes how much of the picture the model is shown.
+     */
+    private fun chatImagePart(part: JSONObject): JSONObject? {
+        val url = part.optString("image_url").ifEmpty {
+            part.optJSONObject("image_url")?.optString("url").orEmpty()
+        }
+        if (url.isEmpty()) return null
+        return JSONObject().apply {
+            put("type", "image_url")
+            put(
+                "image_url",
+                JSONObject().apply {
+                    put("url", url)
+                    part.optString("detail").takeIf { it.isNotEmpty() }?.let { put("detail", it) }
+                },
+            )
+        }
+    }
+
+    /** Whether a translated content value carries nothing worth sending. */
+    private fun isEmptyContent(value: Any?): Boolean = when (value) {
+        null -> true
+        is String -> value.isEmpty()
+        is JSONArray -> value.length() == 0
+        else -> false
+    }
 
     /**
      * Flattens a content value that may be a plain string or a list of parts.
