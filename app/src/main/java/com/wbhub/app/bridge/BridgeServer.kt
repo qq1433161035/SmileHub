@@ -545,7 +545,7 @@ class BridgeServer(
         // incremental.
         if (format == ApiFormat.OPENAI) return relayRaw(output, result)
 
-        val adapter = ApiStreamAdapter(format, model)
+        val adapter = ApiAdapters.streamer(format, model)
         adapter.opening().forEach { output.write(it.toByteArray(StandardCharsets.UTF_8)) }
         output.flush()
 
@@ -588,7 +588,7 @@ class BridgeServer(
         } catch (e: Exception) {
             android.util.Log.e(TAG, "chat relay interrupted", e)
         }
-        adapter.closing(finishReason, usage.prompt, usage.completion).forEach {
+        adapter.finish(finishReason, usage.prompt, usage.completion).forEach {
             output.write(it.toByteArray(StandardCharsets.UTF_8))
         }
         output.flush()

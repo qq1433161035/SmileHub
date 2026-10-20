@@ -96,6 +96,7 @@ fun HubApp(
     onToggleAggregate: (Boolean) -> Unit,
     onToggleAnthropic: (Boolean) -> Unit,
     onToggleResponses: (Boolean) -> Unit,
+    onToggleHttps: (Boolean) -> Unit,
     onToggleDisguise: (Boolean) -> Unit,
     onDismissDisguisePrompt: () -> Unit,
     onToggleStealth: (Boolean) -> Unit,
@@ -272,6 +273,7 @@ fun HubApp(
                 onToggleAggregate = onToggleAggregate,
                 onToggleAnthropic = onToggleAnthropic,
                 onToggleResponses = onToggleResponses,
+                onToggleHttps = onToggleHttps,
                 onToggleDisguise = onToggleDisguise,
             )
         }

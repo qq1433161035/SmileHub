@@ -1598,6 +1598,7 @@ fun BridgeAdvancedSheet(
     onToggleAggregate: (Boolean) -> Unit,
     onToggleAnthropic: (Boolean) -> Unit,
     onToggleResponses: (Boolean) -> Unit,
+    onToggleHttps: (Boolean) -> Unit,
     onToggleDisguise: (Boolean) -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -1685,6 +1686,19 @@ fun BridgeAdvancedSheet(
                     )
                 }
                 Switch(checked = state.formatResponses, onCheckedChange = onToggleResponses)
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("HTTPS 端点", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "同一个接口额外在 ${state.port + 1} 端口提供 TLS 版本，" +
+                            "需要信任本应用签发的证书；明文端口不受影响。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.httpsEnabled, onCheckedChange = onToggleHttps)
             }
         }
     }

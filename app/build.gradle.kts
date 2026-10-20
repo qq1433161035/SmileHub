@@ -90,4 +90,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.material3:material3:1.4.0-alpha18")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    // org.json is part of the Android framework, whose copy is a stub at unit-test
+    // time, so the tests get the real implementation instead.
+    testImplementation("org.json:json:20240303")
+    testImplementation("junit:junit:4.13.2")
 }

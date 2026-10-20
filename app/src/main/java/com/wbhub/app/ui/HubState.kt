@@ -43,6 +43,8 @@ data class HubState(
     val formatAnthropic: Boolean = false,
     /** Whether the OpenAI Responses dialect is served. */
     val formatResponses: Boolean = false,
+    /** Whether the endpoint also answers over TLS. */
+    val httpsEnabled: Boolean = false,
     /** Whether a client's self-identifying system prompt is rewritten. */
     val disguiseIdentity: Boolean = false,
     /** Whether the prompt offering the disguise is open. */

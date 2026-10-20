@@ -166,6 +166,7 @@ class MainActivity : ComponentActivity() {
             aggregateNonStream = BridgeSettings.aggregateNonStream(this),
             formatAnthropic = BridgeSettings.formatAnthropic(this),
             formatResponses = BridgeSettings.formatResponses(this),
+            httpsEnabled = BridgeSettings.httpsEnabled(this),
             disguiseIdentity = BridgeSettings.disguiseIdentity(this),
             lanAddresses = if (lanOn) LanAddresses.current() else emptyList(),
             stealthEnabled = BridgeSettings.stealthEnabled(this),
@@ -290,6 +291,11 @@ class MainActivity : ComponentActivity() {
                 onToggleResponses = { enabled ->
                     BridgeSettings.setFormatResponses(this, enabled)
                     state = state.copy(formatResponses = enabled)
+                    service?.restartBridge()
+                },
+                onToggleHttps = { enabled ->
+                    BridgeSettings.setHttpsEnabled(this, enabled)
+                    state = state.copy(httpsEnabled = enabled)
                     service?.restartBridge()
                 },
                 onSaveLanKey = { key ->
