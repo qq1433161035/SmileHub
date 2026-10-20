@@ -15,8 +15,11 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.security.KeyStore
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
 
 /**
  * A small OpenAI-compatible endpoint on loopback.
@@ -60,6 +63,17 @@ class BridgeServer(
     private val responsesEnabled: Boolean = false,
     /** Whether a client's self-identifying system prompt is rewritten. */
     private val disguiseIdentity: Boolean = false,
+    /**
+     * Whether the endpoint also speaks TLS.
+     *
+     * Off by default. Plain HTTP on loopback is already private to the device,
+     * and a client that was pointed at `http://` keeps working; turning this on
+     * adds a second listener rather than replacing the first, so nothing that
+     * already works can break.
+     */
+    private val httpsEnabled: Boolean = false,
+    /** The certificate to present, or a function returning null when unavailable. */
+    private val certificate: () -> LocalCertificate.Material? = { null },
     private val onCall: (CallRecord) -> Unit = {},
 ) {
 
@@ -73,6 +87,7 @@ class BridgeServer(
     private val pool = Executors.newCachedThreadPool()
     private val client = UpstreamClient()
     private var server: ServerSocket? = null
+    private var tlsServer: ServerSocket? = null
 
     fun start() {
         if (running.getAndSet(true)) return
@@ -88,10 +103,62 @@ class BridgeServer(
         }
         server = socket
         android.util.Log.i(TAG, "bridge listening on $bindAddress:$port")
+        acceptLoop(socket)
+        if (httpsEnabled) startTls(bindAddress)
+    }
+
+    /**
+     * Starts the TLS listener on [port] + 1.
+     *
+     * A second port rather than a shared one: deciding between TLS and plain
+     * text on a connection means reading the first byte and peeking at the TLS
+     * handshake record, and a client that connects to the plain port expecting
+     * TLS would then get a confusing failure instead of a clear one. Two
+     * listeners keep each protocol unambiguous, and the plain one keeps working
+     * for everything already configured against it.
+     */
+    private fun startTls(bindAddress: String) {
+        val material = certificate()
+        if (material == null) {
+            android.util.Log.w(TAG, "HTTPS requested but no certificate is available")
+            return
+        }
+        val socket = try {
+            tlsContext(material).serverSocketFactory
+                .createServerSocket(port + 1, 64, InetAddress.getByName(bindAddress)) as ServerSocket
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "cannot bind TLS on $bindAddress:${port + 1}", e)
+            return
+        }
+        tlsServer = socket
+        android.util.Log.i(TAG, "bridge listening on TLS $bindAddress:${port + 1}")
+        acceptLoop(socket)
+    }
+
+    /** The context a server needs to present [material] and nothing else. */
+    private fun tlsContext(material: LocalCertificate.Material): SSLContext {
+        val store = KeyStore.getInstance("PKCS12")
+        store.load(null, null)
+        // The chain goes in leaf first: a client builds upwards from what it is
+        // shown, and the CA at the end is what completes the path.
+        store.setKeyEntry(
+            "server",
+            material.privateKey,
+            PASSWORD,
+            material.chain,
+        )
+        val keys = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+        keys.init(store, PASSWORD)
+        return SSLContext.getInstance("TLS").apply {
+            init(keys.keyManagers, null, null)
+        }
+    }
+
+    private fun acceptLoop(listener: ServerSocket) {
         Thread {
             while (running.get()) {
                 val accepted = try {
-                    socket.accept()
+                    listener.accept()
                 } catch (e: SocketException) {
                     break
                 } catch (e: Exception) {
@@ -106,6 +173,7 @@ class BridgeServer(
     fun stop() {
         running.set(false)
         runCatching { server?.close() }
+        runCatching { tlsServer?.close() }
         pool.shutdownNow()
     }
 
@@ -728,6 +796,9 @@ class BridgeServer(
 
     private companion object {
         const val TAG = "WBHub"
+
+        /** Password guarding the in-memory key store; it never reaches disk. */
+        val PASSWORD = "wb-hub".toCharArray()
 
         /** How much of the stream tail is kept for usage scanning. */
         const val USAGE_SCAN_BYTES = 8192

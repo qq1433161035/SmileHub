@@ -93,6 +93,8 @@ class BridgeService : Service() {
                 anthropicEnabled = BridgeSettings.formatAnthropic(this),
                 responsesEnabled = BridgeSettings.formatResponses(this),
                 disguiseIdentity = BridgeSettings.disguiseIdentity(this),
+                httpsEnabled = BridgeSettings.httpsEnabled(this),
+                certificate = { tlsCertificate() },
                 onCall = { record -> callLog.append(record) },
             ).also { it.start() }
             scope.launch { refreshModelsLoop() }
@@ -181,6 +183,26 @@ class BridgeService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     /**
+     * The certificate to present, naming every address a client may dial.
+     *
+     * The names are decided here rather than in the server because only this
+     * class knows whether the endpoint is reachable beyond the device: with LAN
+     * access on, a peer dials the phone's own address, and a certificate that
+     * named only loopback would fail that client's hostname check.
+     */
+    private fun tlsCertificate(): LocalCertificate.Material? {
+        val hosts = buildList {
+            add("localhost")
+            add("127.0.0.1")
+            add("::1")
+            if (BridgeSettings.lanEnabled(this@BridgeService)) {
+                addAll(LanAddresses.current())
+            }
+        }
+        return LocalCertificate.load(this, hosts)
+    }
+
+    /**
      * Rebuilds the listener so a changed bind address takes effect.
      *
      * The socket cannot be re-bound in place, so the old one is dropped and a
@@ -200,6 +222,8 @@ class BridgeService : Service() {
             anthropicEnabled = BridgeSettings.formatAnthropic(this),
             responsesEnabled = BridgeSettings.formatResponses(this),
             disguiseIdentity = BridgeSettings.disguiseIdentity(this),
+            httpsEnabled = BridgeSettings.httpsEnabled(this),
+            certificate = { tlsCertificate() },
             onCall = { record -> callLog.append(record) },
         ).also { it.start() }
         BridgeStatus.reset(port)

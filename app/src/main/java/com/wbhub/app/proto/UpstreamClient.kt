@@ -40,18 +40,24 @@ class UpstreamClient {
         // applied in place. Routing it through a string here would parse and
         // re-serialise a multi-megabyte body for nothing, and that copy is
         // time the client spends waiting for its first token.
-        val body = if (region == Wire.Region.GLOBAL) {
+        // Shaped in place, so `request` is the body; only the header derivation
+        // below needs it, and the serialisation happens later, once.
+        if (region == Wire.Region.GLOBAL) {
             Wire.prepareInternationalChatBodyObject(request)
         } else {
             Wire.prepareChatBodyObject(request)
-        }.toString()
+        }
+        val body = request.toString()
         val identity = ChatIdentity.forRegion(region)
         val userAgent = userAgentOverride ?: identity.userAgent
         // Compression, and the recovery when a gateway will not take it, are
         // handled in one place so the endpoint and the built-in chat cannot
         // drift apart on how they reach the same gateway.
+        // Derived once per request from the opening turn, so the turns of one
+        // conversation share an id and the gateway can follow it.
+        val conversationId = Wire.conversationIdFor(request)
         val attempt = Gzip.postChat(region, body) { bytes, compressed ->
-            attemptChat(region, credential, identity, userAgent, bytes, compressed)
+            attemptChat(region, credential, identity, userAgent, bytes, compressed, conversationId)
         }
         return attempt.value
     }
@@ -70,6 +76,7 @@ class UpstreamClient {
         userAgent: String,
         body: ByteArray,
         compressed: Boolean,
+        conversationId: String,
     ): Gzip.Attempt<ChatResult> {
         val headers = Wire.chatHeaders(
             region = region,
@@ -79,6 +86,10 @@ class UpstreamClient {
             enterpriseId = credential.enterpriseId,
             userAgent = userAgent,
             clientVersion = identity.clientVersion,
+            // One conversation, one id: the gateway follows a chat by it, and a
+            // fresh id per turn would make every turn look like a new
+            // conversation to it.
+            conversationId = conversationId,
         ).toMutableMap()
         // Declared only when the body really is compressed, which a body below
         // the threshold is not.

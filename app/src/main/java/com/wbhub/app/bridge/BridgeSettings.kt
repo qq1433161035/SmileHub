@@ -18,6 +18,7 @@ object BridgeSettings {
     private const val KEY_API_KEY = "api_key"
     private const val KEY_LAN_KEY = "lan_key"
     private const val KEY_LAN = "lan_enabled"
+    private const val KEY_HTTPS = "https_enabled"
     private const val KEY_AGGREGATE = "aggregate_non_stream"
     private const val KEY_FORMAT_ANTHROPIC = "format_anthropic"
     private const val KEY_DISGUISE = "disguise_client_identity"
@@ -238,6 +239,23 @@ object BridgeSettings {
     fun setLanEnabled(context: Context, value: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_LAN, value).apply()
+    }
+
+    /**
+     * Whether the endpoint also speaks TLS.
+     *
+     * Off by default. Plain HTTP on loopback is already private to the device,
+     * and a client configured against `http://` keeps working either way — this
+     * opens a second listener on the next port rather than changing the first.
+     * It exists for clients that refuse a plain-text base URL, and for a peer on
+     * the network, where plain HTTP puts the shared key on the wire.
+     */
+    fun httpsEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_HTTPS, false)
+
+    fun setHttpsEnabled(context: Context, value: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_HTTPS, value).apply()
     }
 
     /**

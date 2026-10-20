@@ -2,6 +2,7 @@ package com.wbhub.app.proto
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.charset.StandardCharsets
 
 /**
  * Kotlin port of the WorkBuddy wire protocol.
@@ -209,6 +210,13 @@ object Wire {
     /**
      * Chat headers, including the `X-No-*` conventions the official client uses
      * to state that a value is deliberately absent.
+     *
+     * [conversationId] is the gateway's channel check: since 2026-10-15 the
+     * international gateway refuses any chat request that does not carry the
+     * conversation header trio, answering 11128 "request illegal" with text
+     * about the call not coming from an official client. The domestic gateway
+     * does not check yet, but the headers are sent there too — they are ignored
+     * when not required, and a later change would otherwise break it silently.
      */
     fun chatHeaders(
         region: Region,
@@ -218,6 +226,7 @@ object Wire {
         enterpriseId: String?,
         userAgent: String,
         clientVersion: String,
+        conversationId: String = newConversationId(),
     ): Map<String, String> {
         val headers = commonHeaders(region, uid, domain)
         headers["User-Agent"] = userAgent
@@ -234,7 +243,71 @@ object Wire {
         headers["X-IDE-Name"] = "WorkBuddy"
         headers["X-IDE-Version"] = clientVersion
         headers["X-Product"] = "SaaS"
+        // The channel trio. The conversation id stays the same across the turns
+        // of one conversation so the gateway can follow it; the other two are
+        // per-request and never reused.
+        val messageId = newConversationId()
+        headers["X-Conversation-ID"] = conversationId
+        headers["X-Conversation-Request-ID"] = newConversationId()
+        headers["X-Conversation-Message-ID"] = messageId
+        // The gateway reads this as the same identifier; keeping them equal is
+        // what the official client sends.
+        headers["X-Request-ID"] = messageId
         return headers
+    }
+
+    /** A random identifier in the form the gateway expects. */
+    fun newConversationId(): String = java.util.UUID.randomUUID().toString()
+
+    /**
+     * A conversation id that stays the same across the turns of one chat.
+     *
+     * The gateway wants a stable id but does not say what to derive it from, so
+     * the opening user turn is used: a client resending a conversation carries
+     * the same opening turn, while a new conversation almost always opens
+     * differently. When no opening turn can be found a random id serves just as
+     * well, because the gateway only requires the header to be present.
+     */
+    fun conversationIdFor(request: JSONObject): String {
+        val messages = request.optJSONArray("messages")
+        if (messages != null) {
+            for (i in 0 until messages.length()) {
+                val message = messages.optJSONObject(i) ?: continue
+                if (message.optString("role") != "user") continue
+                val text = flattenForSeed(message.opt("content"))
+                if (text.isNotEmpty()) return digestId(text)
+            }
+        }
+        // A Responses-shaped body keeps its turns under `input`; its opening
+        // user turn identifies the conversation just as well.
+        val input = request.optJSONArray("input")
+        if (input != null) {
+            for (i in 0 until input.length()) {
+                val item = input.optJSONObject(i) ?: continue
+                if (item.optString("role") != "user") continue
+                val text = flattenForSeed(item.opt("content"))
+                if (text.isNotEmpty()) return digestId(text)
+            }
+        }
+        return newConversationId()
+    }
+
+    /** A name-based UUID, so the same text always yields the same id. */
+    private fun digestId(seed: String): String =
+        java.util.UUID.nameUUIDFromBytes(seed.toByteArray(StandardCharsets.UTF_8)).toString()
+
+    private fun flattenForSeed(value: Any?): String = when (value) {
+        is String -> value
+        is JSONArray -> (0 until value.length()).joinToString("") { i ->
+            val part = value.optJSONObject(i)
+            when {
+                part == null -> ""
+                part.has("text") -> part.optString("text")
+                part.has("content") -> flattenForSeed(part.opt("content"))
+                else -> ""
+            }
+        }
+        else -> ""
     }
 
     /** Refresh headers; the refresh token appears here and nowhere else. */

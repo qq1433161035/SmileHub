@@ -146,7 +146,7 @@ class AgentClient {
         // is the largest cost the device pays before the model starts answering.
         // A gateway that will not take it is retried in the clear, and then
         // remembered, so both paths behave the same way.
-        val attempt = Gzip.postChat(region, body) { bytes, compressed ->
+        val attempt = Gzip.postChat(region, body.toString()) { bytes, compressed ->
             val headers = Wire.chatHeaders(
                 region = region,
                 accessToken = credential.accessToken,
@@ -155,6 +155,9 @@ class AgentClient {
                 enterpriseId = credential.enterpriseId,
                 userAgent = identity.userAgent,
                 clientVersion = identity.clientVersion,
+                // One conversation, one id: the transcript is the same
+                // conversation across its turns.
+                conversationId = Wire.conversationIdFor(body),
             ).toMutableMap()
             if (compressed) headers["Content-Encoding"] = "gzip"
             val opened = open(
@@ -280,7 +283,7 @@ class AgentClient {
         contextWindow: Int,
         tools: AgentTools,
         credential: Credential,
-    ): String {
+    ): JSONObject {
         val messages = JSONArray()
         for (message in transcript) {
             val row = JSONObject().apply {
@@ -304,14 +307,13 @@ class AgentClient {
             // out lets the model use its own default.
             if (contextWindow > 0) put("context_window", contextWindow)
         }
-        // The shared shaping rules apply, but which set depends on the build:
-        // the international gateway rejects a body without a leading system
-        // message (code 11128, surfaced as a security-policy block), so the
-        // same branch the bridge takes is taken here.
+        // The shared shaping rules apply, and in object form so the caller can
+        // still read the body afterwards — the conversation header is derived
+        // from it, and re-parsing a serialised copy would be wasted work.
         return if (credential.region == Wire.Region.GLOBAL) {
-            Wire.prepareInternationalChatBody(root.toString())
+            Wire.prepareInternationalChatBodyObject(root)
         } else {
-            Wire.prepareChatBody(root.toString())
+            Wire.prepareChatBodyObject(root)
         }
     }
 
