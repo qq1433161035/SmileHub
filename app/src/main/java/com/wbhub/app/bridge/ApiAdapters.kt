@@ -60,6 +60,18 @@ object ApiAdapters {
      * opening clause, which changes nothing about what the agent is told to do.
      */
     private val BLOCKED_PREFIXES: List<Pair<String, String>> = listOf(
+        // The same rule, extended on 2026-10-20 for a second agent's opening
+        // line. Measured against the live gateway: the runtime form is blocked
+        // only at offset 0 of a system turn, is matched case-insensitively,
+        // and passes when a single space is prepended or when the same text
+        // sits in a user turn. Only the opening clause is rewritten, so the
+        // sentence still tells the model the same thing about itself.
+        "You are an AI agent powered by DeepSeek Harness." to
+            "You are an AI assistant built on DeepSeek Harness.",
+        // The model-specific variant of the same opener. The model name is
+        // kept verbatim; only the surrounding clause changes.
+        "You are a coding agent powered by the deepseek-v4.1-flash model." to
+            "You are an assistant built on the deepseek-v4.1-flash model.",
         // Opening of another vendor's coding agent. Only its first clause is
         // rewritten — the sentence still says the same thing about the agent.
         "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful." to
