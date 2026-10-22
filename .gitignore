@@ -11,14 +11,19 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+keystore/
+
+# Logs
+*.log
 
 # IDE
 .idea/
 *.iml
 .kotlin/
 
-# Local-only build helper (see tools/aapt2 in this environment)
-tools/
+# Local-only build helper (see tools/aapt2 in this environment).
+# 只忽略仓库根目录，避免把 app/src/main/java/com/wbhub/app/tools 源码包也忽略掉。
+/tools/
 
 # OS
 .DS_Store

@@ -1,10 +1,21 @@
 package com.wbhub.app.agent
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Environment
+import android.util.Base64
 import android.util.Log
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
+import com.wbhub.app.tools.ToolExecutor
+import org.json.JSONArray
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
 
 /**
  * The four tools the agent can call.
@@ -19,12 +30,35 @@ class AgentTools(
     private val context: Context,
     private val workDir: File,
     private val useRoot: Boolean,
+    /** Tools backed by the tooling stack (APK/DEX/SO/ADB); null when unavailable. */
+    private val tooling: ToolExecutor? = null,
+    private val sessionId: String? = null,
 ) {
 
-    /** Whatever the model asked for, plus the text that goes back to it. */
-    data class Outcome(val text: String, val ok: Boolean)
+    /**
+     * 私有工具目录。
+     *
+     * targetSdk 28 下，应用私有目录里的 ELF 可以直接 exec（Termux 同款）；
+     * /sdcard 是 noexec，所以可执行文件必须落在这里。
+     */
+    private val toolRoot: File = File(context.filesDir, "WBHub")
 
-    val definitions: List<Map<String, Any>> = listOf(
+    /** Whatever the model asked for, plus the text that goes back to it. */
+    data class Outcome(val text: String, val ok: Boolean, val image: String? = null)
+
+    init {
+        // 工作区自带扩展目录：下载的脚本、纯 Python 包、可执行文件各有归处。
+        runCatching {
+            workDir.mkdirs()
+            toolRoot.mkdirs()
+            EXTENSION_DIRS.forEach {
+                File(toolRoot, it).mkdirs()
+                File(workDir, it).mkdirs()
+            }
+        }
+    }
+
+    private val builtinDefinitions: List<Map<String, Any>> = listOf(
         tool(
             name = "read",
             description = "Read a text file and return its contents with line numbers. " +
@@ -59,10 +93,70 @@ class AgentTools(
             required = listOf("path", "old_text", "new_text"),
         ),
         tool(
+            name = "view_image",
+            description = "Open an image file (png/jpg/webp) so you can actually see it. " +
+                "Call this whenever the user gives a path to a screenshot or photo; " +
+                "reading an image with read/bash only returns binary garbage.",
+            properties = mapOf(
+                "path" to stringProp("Image path, relative to the working directory or absolute."),
+            ),
+            required = listOf("path"),
+        ),
+        tool(
+            name = "python",
+            description = "Run Python 3 code on the device and return its stdout/stderr. The " +
+                "standard library is bundled, and py_modules/ + site-packages/ (workspace and " +
+                "the private tools/ directory) are on sys.path, so pure-Python packages " +
+                "downloaded there import directly. " +
+                "Pass code for a one-off snippet, or path to run a " +
+                ".py file saved in the workspace — that is how reusable Python plugins are kept, " +
+                "the same way as shell scripts. ctypes and cffi are blocked: loading native " +
+                "libraries in-process can crash the whole app. Use this instead of looking for " +
+                "a python binary in bash.",
+            properties = mapOf(
+                "code" to stringProp("Python source code to execute. Omit when using path."),
+                "path" to stringProp(
+                    "A .py file to run, relative to the working directory or absolute. " +
+                        "Takes precedence over code.",
+                ),
+                "args" to mapOf(
+                    "type" to "array",
+                    "items" to mapOf("type" to "string"),
+                    "description" to "Command-line arguments exposed as sys.argv.",
+                ),
+                "timeout_seconds" to intProp("Stop waiting after this many seconds. Defaults to 60."),
+            ),
+            required = emptyList(),
+        ),
+        tool(
+            name = "download",
+            description = "Download a file over http(s), so a missing capability can be fetched " +
+                "instead of only using built-ins. A path starting with tools/ goes to the " +
+                "app-private tool directory (the only place where downloaded ELF binaries can be " +
+                "executed on this build); any other path goes to the visible working directory. " +
+                "Use tools/bin for executables (prepended to PATH), tools/py_modules with " +
+                "unzip=true for pure-Python packages (on sys.path), tools/lib for shared libraries.",
+            properties = mapOf(
+                "url" to stringProp("http(s) URL to fetch."),
+                "path" to stringProp(
+                    "Destination relative to the working directory. With unzip=true this is the " +
+                        "directory to extract into, e.g. py_modules.",
+                ),
+                "unzip" to boolProp("Treat the download as a zip and extract it into the path directory."),
+                "timeout_seconds" to intProp("Abort when stalled this long. Defaults to 120."),
+            ),
+            required = listOf("url", "path"),
+        ),
+        tool(
             name = "bash",
             description = "Run a shell command and return its combined output. The " +
                 "working directory is the agent's working directory. Root is used " +
-                "when it is enabled.",
+                "when it is enabled. Note: pm/adb run as the app UID and are denied " +
+                "without root; use package_info to query packages and apk_install/apk_uninstall " +
+                "instead of shell pm. screencap, uiautomator and service call also fail under " +
+                "the app UID; when an ADB session is connected, run them through adb_shell. " +
+                "There is no python binary in this shell: use the python tool instead. " +
+                "The private tools/bin directory is first on PATH.",
             properties = mapOf(
                 "command" to stringProp("Shell command to run."),
                 "timeout_seconds" to intProp("Kill the command after this many seconds. Defaults to 60."),
@@ -71,6 +165,8 @@ class AgentTools(
         ),
     )
 
+    val definitions: List<Map<String, Any>> = builtinDefinitions + tooling?.definitions().orEmpty()
+
     /**
      * Runs one tool call. Unknown names come back as a plain error, not a throw.
      *
@@ -78,6 +174,16 @@ class AgentTools(
      * tool goes through it, including any future caller.
      */
     fun run(name: String, args: Map<String, Any?>, approval: ApprovalMode, ask: (String) -> Boolean): Outcome {
+        val toolingSpec = tooling?.spec(name)
+        if (toolingSpec != null) {
+            if (ToolPolicy.needsApproval(approval, toolingSpec.risk)) {
+                if (!ask(ToolPolicy.summarize(name, args))) {
+                    return Outcome("用户拒绝执行：${ToolPolicy.summarize(name, args)}", false)
+                }
+            }
+            val result = tooling.execute(name, args, sessionId, approval.name)
+            return Outcome(result.render(), result.ok)
+        }
         if (ToolPolicy.needsApproval(approval, name)) {
             if (!ask(ToolPolicy.summarize(name, args))) {
                 return Outcome("用户拒绝执行：${ToolPolicy.summarize(name, args)}", false)
@@ -87,6 +193,9 @@ class AgentTools(
             "read" -> read(args)
             "write" -> write(args)
             "edit" -> edit(args)
+            "view_image" -> viewImage(args)
+            "python" -> python(args)
+            "download" -> download(args)
             "bash" -> bash(args)
             else -> Outcome("unknown tool: $name", false)
         }
@@ -179,6 +288,188 @@ class AgentTools(
     }
 
     // ------------------------------------------------------------------ //
+    // view_image
+    // ------------------------------------------------------------------ //
+
+    /** 把本地图片读成 data URL，由循环附在一条用户消息里交给模型。 */
+    private fun viewImage(args: Map<String, Any?>): Outcome {
+        val file = resolve(args.str("path")) ?: return Outcome("view_image needs a path", false)
+        if (!file.exists()) return Outcome("no such file: ${file.path}", false)
+        if (file.isDirectory) return Outcome("${file.path} is a directory", false)
+        return runCatching {
+            val bytes = file.readBytes()
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: return Outcome("not a decodable image: ${file.path}", false)
+            val maxSide = 1568
+            val scale = minOf(1f, maxSide.toFloat() / maxOf(bitmap.width, bitmap.height))
+            val scaled = if (scale < 1f) {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    (bitmap.width * scale).toInt().coerceAtLeast(1),
+                    (bitmap.height * scale).toInt().coerceAtLeast(1),
+                    true,
+                )
+            } else {
+                bitmap
+            }
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            val dataUrl = "data:image/jpeg;base64," +
+                Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+            Outcome(
+                "图片已读取并附在下一段上下文里：${file.path}（${bitmap.width}x${bitmap.height}）",
+                true,
+                image = dataUrl,
+            )
+        }.getOrElse { Outcome("view_image failed: ${it.message}", false) }
+    }
+
+    // ------------------------------------------------------------------ //
+    // python
+    // ------------------------------------------------------------------ //
+
+    /** 内置 CPython 里执行代码或工作区里的 .py 脚本，输出合并后回给模型。 */
+    private fun python(args: Map<String, Any?>): Outcome {
+        val script = args.str("path")?.let { path ->
+            val file = resolve(path) ?: return Outcome("python needs a valid path", false)
+            if (!file.exists()) return Outcome("no such file: ${file.path}", false)
+            if (file.isDirectory) return Outcome("${file.path} is a directory", false)
+            file
+        }
+        val code = script?.readText() ?: args.str("code")
+            ?: return Outcome("python needs code or path", false)
+        val filename = script?.absolutePath ?: "<wbhub>"
+        val argv = (args["args"] as? List<*>)
+            ?.map { it?.toString().orEmpty() }
+            .orEmpty()
+        val argvJson = JSONArray(argv).toString()
+        // 私有工具目录优先：下载的纯 Python 包解压到 tools/py_modules 即可 import。
+        val sysPathJson = JSONArray().apply {
+            put(File(toolRoot, "py_modules").absolutePath)
+            put(File(toolRoot, "site-packages").absolutePath)
+            put(File(workDir, "py_modules").absolutePath)
+            put(File(workDir, "site-packages").absolutePath)
+        }.toString()
+        val timeout = (args.int("timeout_seconds") ?: 60).coerceIn(1, 300)
+        if (!Python.isStarted()) {
+            synchronized(PYTHON_LOCK) {
+                if (!Python.isStarted()) Python.start(AndroidPlatform(context.applicationContext))
+            }
+        }
+        var output = ""
+        var failure: Throwable? = null
+        val worker = Thread({
+            try {
+                output = Python.getInstance()
+                    .getModule("wbhub_coderunner")
+                    .callAttr("run", code, workDir.absolutePath, filename, argvJson, sysPathJson)
+                    .toString()
+            } catch (error: Throwable) {
+                failure = error
+            }
+        }, "wbhub-python")
+        // 解释器无法从外部强杀，超时后只能把线程留在后台。
+        worker.isDaemon = true
+        worker.start()
+        worker.join(timeout * 1000L)
+        if (worker.isAlive) return Outcome("python 超时（${timeout}s），代码仍在后台运行", false)
+        failure?.let {
+            Log.e(TAG, "python failed", it)
+            return Outcome("python 启动或执行失败：${it.message}", false)
+        }
+        val ok = !output.startsWith("Traceback (most recent call last):")
+        val text = output.ifBlank { "(no output)" }
+        val clipped = if (text.length > MAX_PYTHON_OUTPUT) {
+            text.take(MAX_PYTHON_OUTPUT) + "\n… 输出已截断"
+        } else {
+            text
+        }
+        return Outcome(clipped, ok)
+    }
+
+    // ------------------------------------------------------------------ //
+    // download
+    // ------------------------------------------------------------------ //
+
+    /** 从网络取一个文件/压缩包，让 Agent 能自己补能力。 */
+    private fun download(args: Map<String, Any?>): Outcome {
+        val url = args.str("url") ?: return Outcome("download needs url", false)
+        val rawPath = args.str("path")?.trim()?.removePrefix("./")
+            ?: return Outcome("download needs path", false)
+        val inTools = rawPath == "tools" || rawPath.startsWith("tools/")
+        val target = if (inTools) {
+            File(toolRoot, rawPath.removePrefix("tools").trimStart('/', '\\'))
+        } else {
+            resolve(rawPath) ?: return Outcome("download needs path", false)
+        }
+        val canonical = target.canonicalFile
+        val allowed = listOf(workDir.canonicalFile, toolRoot.canonicalFile)
+            .any { canonical == it || canonical.path.startsWith(it.path + File.separator) }
+        if (!allowed) {
+            return Outcome("下载只能写进工作区或私有工具目录", false)
+        }
+        val timeoutSeconds = (args.int("timeout_seconds") ?: 120).coerceIn(5, 600)
+        val unzip = args["unzip"] == true
+        return runCatching {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15_000
+                readTimeout = timeoutSeconds * 1000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) WorkBuddyHub")
+            }
+            try {
+                val code = connection.responseCode
+                if (code !in 200..299) return Outcome("HTTP $code：$url", false)
+                if (unzip) {
+                    canonical.mkdirs()
+                    val tmp = File(workDir, ".download-${System.currentTimeMillis()}.zip")
+                    connection.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    val count = runCatching { unzipInto(tmp, canonical) }.getOrElse {
+                        tmp.delete()
+                        return Outcome("解压失败：${it.message}", false)
+                    }
+                    tmp.delete()
+                    Outcome("已解压 $count 个文件到 ${canonical.path}", true)
+                } else {
+                    canonical.parentFile?.mkdirs()
+                    connection.inputStream.use { input ->
+                        canonical.outputStream().use { input.copyTo(it) }
+                    }
+                    canonical.setExecutable(true, false)
+                    Outcome("已下载 ${canonical.path}（${canonical.length()} 字节）", true)
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrElse { Outcome("download failed: ${it.message}", false) }
+    }
+
+    /** 解压 zip，拒绝把条目写到目标目录之外。 */
+    private fun unzipInto(archive: File, destDir: File): Int {
+        val root = destDir.canonicalFile
+        var count = 0
+        ZipInputStream(archive.inputStream().buffered()).use { zin ->
+            while (true) {
+                val entry = zin.nextEntry ?: break
+                val out = File(destDir, entry.name).canonicalFile
+                if (out != root && !out.path.startsWith(root.path + File.separator)) {
+                    zin.closeEntry()
+                    continue
+                }
+                if (entry.isDirectory) {
+                    out.mkdirs()
+                } else {
+                    out.parentFile?.mkdirs()
+                    out.outputStream().use { zin.copyTo(it) }
+                    count++
+                }
+                zin.closeEntry()
+            }
+        }
+        return count
+    }
+
+    // ------------------------------------------------------------------ //
     // bash
     // ------------------------------------------------------------------ //
 
@@ -195,9 +486,17 @@ class AgentTools(
         }
 
         return runCatching {
+            // 私有工具目录的 bin 排在最前：下载的可执行文件可以直接按名字调用。
+            val binDirs = listOf(File(toolRoot, "bin"), File(workDir, "bin"))
+                .joinToString(":") { it.absolutePath }
+            val basePath = System.getenv("PATH").orEmpty()
             val process = ProcessBuilder(*argv)
                 .directory(workDir)
                 .redirectErrorStream(true)
+                .apply {
+                    environment()["PATH"] =
+                        if (basePath.isBlank()) binDirs else "$binDirs:$basePath"
+                }
                 .start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
             val finished = process.waitFor(timeout.toLong(), TimeUnit.SECONDS)
@@ -239,6 +538,13 @@ class AgentTools(
         private const val DEFAULT_TIMEOUT_SECONDS = 60
         private const val MAX_TIMEOUT_SECONDS = 600
         private const val OUTPUT_LIMIT = 30_000
+        private const val MAX_PYTHON_OUTPUT = 20_000
+
+        /** Python.start 只能成功一次，并发调用要串行。 */
+        private val PYTHON_LOCK = Any()
+
+        /** 工作区里的扩展目录，Agent 自己下载的文件按用途存放。 */
+        private val EXTENSION_DIRS = listOf("bin", "py_modules", "site-packages", "downloads")
 
         /** The default place for agent work: a visible folder on shared storage. */
         fun defaultWorkDir(): File =
@@ -252,10 +558,10 @@ class AgentTools(
          * call may raise the manager's prompt, so it belongs off the main
          * thread and only when the user turns the switch on.
          */
-        fun detectRoot(): Boolean = runCatching {
+        fun detectRoot(timeoutSeconds: Long = 5): Boolean = runCatching {
             val process = ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor(5, TimeUnit.SECONDS)
+            process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
             output.contains("uid=0")
         }.getOrDefault(false)
 

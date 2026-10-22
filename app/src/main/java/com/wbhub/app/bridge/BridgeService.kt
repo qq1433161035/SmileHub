@@ -8,6 +8,7 @@ import android.os.PowerManager
 import com.wbhub.app.proto.CredentialStore
 import com.wbhub.app.proto.ProtoModel
 import com.wbhub.app.proto.UpstreamClient
+import com.wbhub.app.storage.AppStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -60,6 +61,7 @@ class BridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        AppStorage.init(this)
         store = CredentialStore(this)
         callLog = CallLogStore(this)
         Notifications.ensureChannel(this)
@@ -136,6 +138,10 @@ class BridgeService : Service() {
      * bridge still runs; it is simply subject to the usual background policy.
      */
     private fun showOverlay() {
+        if (!BridgeSettings.overlayEnabled(this)) {
+            removeOverlay()
+            return
+        }
         if (overlay?.isShowing() == true) return
         if (!android.provider.Settings.canDrawOverlays(this)) {
             android.util.Log.i("WBHub", "overlay permission not granted; bridge runs without the panel")
@@ -164,6 +170,11 @@ class BridgeService : Service() {
         overlay?.hide()
         overlay = null
         overlayRef = null
+    }
+
+    /** 高级设置里切换「显示悬浮窗」后立即生效。 */
+    fun applyOverlaySetting() {
+        if (BridgeSettings.overlayEnabled(this)) showOverlay() else removeOverlay()
     }
 
     private suspend fun refreshModelsLoop() {

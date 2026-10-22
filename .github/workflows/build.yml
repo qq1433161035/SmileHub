@@ -34,6 +34,12 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # Chaquopy 在构建期需要一个 CPython 3.12 解释器
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -52,9 +58,9 @@ jobs:
             exit 0
           fi
           mkdir -p keystore
-          echo "$KEYSTORE_BASE64" | base64 -d > keystore/wb-hub.jks
+          echo "$KEYSTORE_BASE64" | base64 -d > keystore/smilehub.jks
           {
-            echo "storeFile=keystore/wb-hub.jks"
+            echo "storeFile=keystore/smilehub.jks"
             echo "storePassword=$KEYSTORE_PASSWORD"
             echo "keyAlias=$KEY_ALIAS"
             echo "keyPassword=$KEY_PASSWORD"
@@ -94,24 +100,24 @@ jobs:
           SHA=$(git rev-parse --short HEAD)
           shopt -s nullglob
           for APK in app/build/outputs/apk/debug/*.apk; do
-            cp "$APK" "app/build/outputs/apk/debug/wb-hub-${VERSION}-${SHA}-debug.apk"
+            cp "$APK" "app/build/outputs/apk/debug/smilehub-${VERSION}-${SHA}-debug.apk"
           done
           for APK in app/build/outputs/apk/release/*.apk; do
             SUFFIX=""
             case "$APK" in *-unsigned.apk) SUFFIX="-unsigned";; esac
-            cp "$APK" "app/build/outputs/apk/release/wb-hub-${VERSION}-${SHA}-release${SUFFIX}.apk"
+            cp "$APK" "app/build/outputs/apk/release/smilehub-${VERSION}-${SHA}-release${SUFFIX}.apk"
           done
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: wb-hub-debug
-          path: app/build/outputs/apk/debug/wb-hub-*.apk
+          name: smilehub-debug
+          path: app/build/outputs/apk/debug/smilehub-*.apk
           if-no-files-found: error
 
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: wb-hub-release
-          path: app/build/outputs/apk/release/wb-hub-*.apk
+          name: smilehub-release
+          path: app/build/outputs/apk/release/smilehub-*.apk
           if-no-files-found: error

@@ -1,6 +1,7 @@
 package com.wbhub.app.bridge
 
 import android.content.Context
+import com.wbhub.app.storage.AppStorage
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -153,8 +154,8 @@ data class AccountTotals(
  */
 class CallLogStore(private val context: Context) {
 
-    private val file = File(context.filesDir, "wb-call-log.json")
-    private val totalsFile = File(context.filesDir, "wb-call-totals.json")
+    private val file = File(AppStorage.records(context), "wb-call-log.json")
+    private val totalsFile = File(AppStorage.records(context), "wb-call-totals.json")
     private val lock = Any()
 
     /**

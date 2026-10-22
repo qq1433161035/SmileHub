@@ -1,6 +1,7 @@
-package com.wbhub.app.bridge
+﻿package com.wbhub.app.bridge
 
 import android.content.Context
+import com.wbhub.app.storage.AppStorage
 
 /**
  * User preferences for the status panel.
@@ -24,6 +25,7 @@ object BridgeSettings {
     private const val KEY_DISGUISE = "disguise_client_identity"
     private const val KEY_FORMAT_RESPONSES = "format_responses"
     private const val KEY_STEALTH = "stealth_enabled"
+    private const val KEY_OVERLAY = "overlay_enabled"
     private const val KEY_DOT_X = "dot_x"
     private const val KEY_DOT_Y = "dot_y"
     private const val KEY_DOT_COLOR = "dot_color"
@@ -42,37 +44,52 @@ object BridgeSettings {
      * whatever the user is doing; it answers nothing when tapped.
      */
     fun stealthEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_STEALTH, false)
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_STEALTH, false)
 
     fun setStealthEnabled(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_STEALTH, value).apply()
+    }
+
+    /**
+     * Whether the running bridge shows its floating panel.
+     *
+     * The panel exists to keep the process visible, so the system does not
+     * freeze it; for a user who only calls the endpoint from other devices the
+     * notification is enough and the panel just gets in the way.
+     */
+    fun overlayEnabled(context: Context): Boolean =
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_OVERLAY, false)
+
+    fun setOverlayEnabled(context: Context, value: Boolean) {
+        AppStorage.prefs(context, PREFS)
+            .edit().putBoolean(KEY_OVERLAY, value).apply()
     }
 
     /** Dot colour as a packed ARGB value. */
     fun dotColor(context: Context): Int =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getInt(KEY_DOT_COLOR, DEFAULT_DOT_COLOR)
 
     fun setDotColor(context: Context, value: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_DOT_COLOR, value).apply()
     }
 
     /** Dot diameter in dp. */
     fun dotSize(context: Context): Int =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(KEY_DOT_SIZE, DEFAULT_DOT_SIZE)
+        AppStorage.prefs(context, PREFS).getInt(KEY_DOT_SIZE, DEFAULT_DOT_SIZE)
 
     fun setDotSize(context: Context, value: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_DOT_SIZE, value.coerceIn(MIN_DOT_SIZE, MAX_DOT_SIZE)).apply()
     }
 
     fun dotShape(context: Context): DotShape =
-        DotShape.fromName(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DOT_SHAPE, null))
+        DotShape.fromName(AppStorage.prefs(context, PREFS).getString(KEY_DOT_SHAPE, null))
 
     fun setDotShape(context: Context, value: DotShape) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putString(KEY_DOT_SHAPE, value.name).apply()
     }
 
@@ -85,11 +102,11 @@ object BridgeSettings {
      * one, and would make the setting unable to express that choice.
      */
     fun dotAlpha(context: Context): Float =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getFloat(KEY_DOT_ALPHA, DEFAULT_DOT_ALPHA)
 
     fun setDotAlpha(context: Context, value: Float) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putFloat(KEY_DOT_ALPHA, value.coerceIn(0f, 1f)).apply()
     }
 
@@ -101,21 +118,21 @@ object BridgeSettings {
      * least its own diameter gives every pixel a turn being dark.
      */
     fun burnInEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_BURN_IN, true)
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_BURN_IN, true)
 
     fun setBurnInEnabled(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_BURN_IN, value).apply()
     }
 
     /** How long the dot stays in one position. */
     fun burnInIntervalMs(context: Context): Long =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getLong(KEY_BURN_IN_INTERVAL, DEFAULT_BURN_IN_INTERVAL_MS)
             .coerceIn(MIN_BURN_IN_INTERVAL_MS, MAX_BURN_IN_INTERVAL_MS)
 
     fun setBurnInIntervalMs(context: Context, value: Long) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putLong(
                 KEY_BURN_IN_INTERVAL,
                 value.coerceIn(MIN_BURN_IN_INTERVAL_MS, MAX_BURN_IN_INTERVAL_MS),
@@ -130,12 +147,12 @@ object BridgeSettings {
      * want to look.
      */
     fun callLogLimit(context: Context): Int =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getInt(KEY_CALL_LIMIT, DEFAULT_CALL_LIMIT)
             .coerceIn(MIN_CALL_LIMIT, MAX_CALL_LIMIT)
 
     fun setCallLogLimit(context: Context, value: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_CALL_LIMIT, value.coerceIn(MIN_CALL_LIMIT, MAX_CALL_LIMIT)).apply()
     }
 
@@ -174,14 +191,14 @@ object BridgeSettings {
      * fresh install usable without visiting this screen.
      */
     fun apiKey(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getString(KEY_API_KEY, "")
             ?.takeIf { it.isNotBlank() }
             ?: DEFAULT_API_KEY
 
     fun setApiKey(context: Context, value: String) {
         val trimmed = value.trim().ifBlank { DEFAULT_API_KEY }
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putString(KEY_API_KEY, trimmed).apply()
     }
 
@@ -191,12 +208,12 @@ object BridgeSettings {
      * Persisted so a restart keeps the chosen port: a client configured against
      * it would otherwise break every time the app is reopened.
      */
-    fun port(context: Context): Int = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    fun port(context: Context): Int = AppStorage.prefs(context, PREFS)
         .getInt(KEY_PORT, DEFAULT_PORT)
         .coerceIn(MIN_PORT, MAX_PORT)
 
     fun setPort(context: Context, value: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_PORT, value.coerceIn(MIN_PORT, MAX_PORT)).apply()
     }
 
@@ -214,14 +231,14 @@ object BridgeSettings {
      * means revoking peer access does not disturb this device's own clients.
      */
     fun lanKey(context: Context): String =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getString(KEY_LAN_KEY, "")
             ?.takeIf { it.isNotBlank() }
             ?: DEFAULT_LAN_KEY
 
     fun setLanKey(context: Context, value: String) {
         val trimmed = value.trim()
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putString(KEY_LAN_KEY, trimmed).apply()
     }
 
@@ -234,10 +251,10 @@ object BridgeSettings {
      * only binding that needs no further trust decision.
      */
     fun lanEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_LAN, false)
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_LAN, false)
 
     fun setLanEnabled(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_LAN, value).apply()
     }
 
@@ -251,10 +268,10 @@ object BridgeSettings {
      * the network, where plain HTTP puts the shared key on the wire.
      */
     fun httpsEnabled(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_HTTPS, false)
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_HTTPS, false)
 
     fun setHttpsEnabled(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_HTTPS, value).apply()
     }
 
@@ -267,7 +284,7 @@ object BridgeSettings {
      * generation finishes, which is a real cost for anyone who did not need it.
      */
     fun aggregateNonStream(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getBoolean(KEY_AGGREGATE, false)
 
     /**
@@ -278,11 +295,11 @@ object BridgeSettings {
      * open.
      */
     fun formatAnthropic(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getBoolean(KEY_FORMAT_ANTHROPIC, false)
 
     fun setFormatAnthropic(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_FORMAT_ANTHROPIC, value).apply()
     }
 
@@ -301,53 +318,53 @@ object BridgeSettings {
      * nothing of the sort a few string comparisons per message.
      */
     fun disguiseIdentity(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getBoolean(KEY_DISGUISE, true)
 
     fun setDisguiseIdentity(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_DISGUISE, value).apply()
     }
 
     /** Whether the OpenAI Responses endpoint is served. */
     fun formatResponses(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getBoolean(KEY_FORMAT_RESPONSES, false)
 
     fun setFormatResponses(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_FORMAT_RESPONSES, value).apply()
     }
 
     fun setAggregateNonStream(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_AGGREGATE, value).apply()
     }
 
     fun opacity(context: Context): Float =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .getFloat(KEY_OPACITY, 0.94f)
 
     fun setOpacity(context: Context, value: Float) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putFloat(KEY_OPACITY, value.coerceIn(0.15f, 1f)).apply()
     }
 
     fun locked(context: Context): Boolean =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_LOCKED, false)
+        AppStorage.prefs(context, PREFS).getBoolean(KEY_LOCKED, false)
 
     fun setLocked(context: Context, value: Boolean) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putBoolean(KEY_LOCKED, value).apply()
     }
 
     fun position(context: Context): Pair<Int, Int> {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = AppStorage.prefs(context, PREFS)
         return prefs.getInt(KEY_X, -1) to prefs.getInt(KEY_Y, -1)
     }
 
     fun setPosition(context: Context, x: Int, y: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_X, x).putInt(KEY_Y, y).apply()
     }
 
@@ -359,12 +376,12 @@ object BridgeSettings {
      * would make switching modes move the other one.
      */
     fun dotPosition(context: Context): Pair<Int, Int> {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = AppStorage.prefs(context, PREFS)
         return prefs.getInt(KEY_DOT_X, -1) to prefs.getInt(KEY_DOT_Y, -1)
     }
 
     fun setDotPosition(context: Context, x: Int, y: Int) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        AppStorage.prefs(context, PREFS)
             .edit().putInt(KEY_DOT_X, x).putInt(KEY_DOT_Y, y).apply()
     }
 }

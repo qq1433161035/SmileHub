@@ -1,6 +1,7 @@
 package com.wbhub.app.bridge
 
 import android.content.Context
+import com.wbhub.app.storage.AppStorage
 import org.json.JSONArray
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -52,9 +53,9 @@ object LocalCertificate {
     private const val CA_DAYS = 3650L
     private const val LEAF_DAYS = 825L
 
-    private const val CA_COMMON_NAME = "WorkBuddy Hub Local CA"
-    private const val LEAF_COMMON_NAME = "WorkBuddy Hub Local"
-    private const val ORGANISATION = "WorkBuddy Hub"
+    private const val CA_COMMON_NAME = "SmileHub Local CA"
+    private const val LEAF_COMMON_NAME = "SmileHub Local"
+    private const val ORGANISATION = "SmileHub"
 
     /** An issued certificate and its key, ready to hand to a TLS context. */
     class Material(
@@ -67,7 +68,7 @@ object LocalCertificate {
 
     /** Returns the certificate for [hosts], issuing or reissuing it as needed. */
     fun load(context: Context, hosts: List<String>): Material? = try {
-        val dir = context.filesDir
+        val dir = AppStorage.certificates(context)
         val caCertFile = File(dir, CA_FILE)
         val caKeyFile = File(dir, CA_KEY_FILE)
         val leafCertFile = File(dir, LEAF_FILE)
@@ -121,7 +122,7 @@ object LocalCertificate {
 
     /** The CA a client must trust, or null when none has been made yet. */
     fun issuer(context: Context): ByteArray? {
-        val file = File(context.filesDir, CA_FILE)
+        val file = File(AppStorage.certificates(context), CA_FILE)
         return if (file.exists()) file.readBytes() else null
     }
 

@@ -1,11 +1,10 @@
 package com.wbhub.app.ui
 
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CardGiftcard
 import androidx.compose.material.icons.filled.Hub
-import androidx.compose.material.icons.filled.ReceiptLong
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SmartToy
-import androidx.compose.material.icons.filled.Key
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.wbhub.app.agent.AgentStore
 import com.wbhub.app.agent.AgentTools
@@ -21,11 +20,10 @@ import com.wbhub.app.proto.HubModel
 import com.wbhub.app.proto.Wire
 
 enum class HubTab(val label: String, val icon: ImageVector) {
-    Credential("凭证", Icons.Default.Key),
-    Bridge("API 平台", Icons.Default.Hub),
+    Personal("个人信息", Icons.Default.Person),
+    Bridge("API", Icons.Default.Hub),
     Agent("对话", Icons.Default.SmartToy),
-    Calls("调用记录", Icons.Default.ReceiptLong),
-    Rewards("积分", Icons.Default.CardGiftcard),
+    Settings("设置", Icons.Default.Settings),
 }
 
 /** Everything the screens render; owned by the activity and backed by the service. */
@@ -66,7 +64,11 @@ data class HubState(
     val showCredentialDrawer: Boolean = false,
     val showLogoutConfirm: Boolean = false,
     val overlayAllowed: Boolean = false,
+    /** Whether the running bridge shows its floating panel. */
+    val overlayEnabled: Boolean = false,
     val calls: List<CallRecord> = emptyList(),
+    /** Whether the call log has been read; the page loads it on demand. */
+    val callsLoaded: Boolean = false,
     /** Running totals per account, independent of the list cap. */
     val accountTotals: AccountTotals = AccountTotals(),
     /** How many call records to keep. */
@@ -94,6 +96,10 @@ data class HubState(
     val realm: Wire.Region = Wire.Region.CN,
     val accounts: Map<Wire.Region, List<SavedAccount>> = emptyMap(),
     val activeAccountId: String? = null,
+    /** Whether the 工程 page covers the tab UI. */
+    val showTooling: Boolean = false,
+    /** Projects and their artifacts, loaded when the 工程 page opens. */
+    val tooling: ToolingState = ToolingState(),
 )
 
 /** One line in the agent transcript. */
@@ -101,13 +107,15 @@ data class AgentEntry(
     val role: Role,
     val text: String,
 ) {
-    enum class Role { USER, ASSISTANT, REASONING, TOOL, ERROR }
+    enum class Role { USER, ASSISTANT, REASONING, TOOL, COMPACT, ERROR }
 }
 
 /** Everything the agent page renders. */
 data class AgentState(
     val entries: List<AgentEntry> = emptyList(),
     val input: String = "",
+    /** Data URL of the image attached to the next prompt, or null. */
+    val pendingImage: String? = null,
     val modelId: String = "",
     val effort: String = "",
     val contextWindow: Int = 0,
@@ -117,6 +125,16 @@ data class AgentState(
     /** Whether this device actually granted root, probed on demand. */
     val rootAvailable: Boolean = false,
     val approval: ApprovalMode = ApprovalMode.AUTO,
+    /** Tool round cap for one prompt; user-configurable. */
+    val maxRounds: Int = 100,
+    /** 上下文压缩总开关。 */
+    val compactionEnabled: Boolean = true,
+    /** 触发压缩的窗口占比（30–95）。 */
+    val compactTrigger: Int = 70,
+    /** 压缩时保留最近多少个用户轮次。 */
+    val compactKeepTurns: Int = 6,
+    /** 工具输出超过多少字符落盘。 */
+    val offloadChars: Int = 32_000,
     val storageGranted: Boolean = false,
     val workDir: String = AgentTools.defaultWorkDir().absolutePath,
     /** Title of the conversation in progress, shown next to the session picker. */

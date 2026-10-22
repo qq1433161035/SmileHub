@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
@@ -77,9 +78,113 @@ import com.wbhub.app.data.CheckinItem
 import com.wbhub.app.proto.Wire
 
 import com.wbhub.app.proto.HubModel
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+/**
+ * The 个人信息 page.
+ *
+ * Account, points and call records used to be separate tabs; they all describe
+ * the same signed-in account, so they now share one scroll. Each section keeps
+ * its own controls and callbacks.
+ */
 @Composable
-fun CredentialScreen(
+fun PersonalScreen(
+    state: HubState,
+    onSwitchRealm: (Wire.Region) -> Unit,
+    onSwitchAccount: (String) -> Unit,
+    onDeleteAccount: (String) -> Unit,
+    onLogin: (Wire.Region) -> Unit,
+    onLogout: () -> Unit,
+    onOpenDetails: () -> Unit,
+    onCheckin: () -> Unit,
+    onCheckinAll: () -> Unit,
+    onRefreshBalance: () -> Unit,
+    onStreakBonus: () -> Unit,
+    onActivityReport: () -> Unit,
+    onTravel: () -> Unit,
+    onNightOwl: () -> Unit,
+    onClearCalls: () -> Unit,
+    onRefreshCalls: () -> Unit,
+    onOpenCallSettings: () -> Unit,
+    onOpenModelStats: () -> Unit,
+) {
+    // 调用记录按需加载：进入页面只拉余额，列表由下面的按钮或下拉触发。
+    var refreshing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = {
+            refreshing = true
+            scope.launch {
+                onRefreshCalls()
+                refreshing = false
+            }
+        },
+    ) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item { SectionLabel("账号") }
+            credentialItems(
+                state = state,
+                onSwitchRealm = onSwitchRealm,
+                onSwitchAccount = onSwitchAccount,
+                onDeleteAccount = onDeleteAccount,
+                onLogin = onLogin,
+                onLogout = onLogout,
+                onOpenDetails = onOpenDetails,
+            )
+            item { SectionLabel("积分") }
+            rewardsItems(
+                state = state,
+                onCheckin = onCheckin,
+                onCheckinAll = onCheckinAll,
+                onRefreshBalance = onRefreshBalance,
+                onStreakBonus = onStreakBonus,
+                onActivityReport = onActivityReport,
+                onTravel = onTravel,
+                onNightOwl = onNightOwl,
+            )
+            item { SectionLabel("调用记录") }
+            if (state.callsLoaded) {
+                callItems(
+                    state = state,
+                    onClear = onClearCalls,
+                    onOpenSettings = onOpenCallSettings,
+                    onOpenModelStats = onOpenModelStats,
+                )
+            } else {
+                item { LoadCallsCard(onLoad = onRefreshCalls) }
+            }
+        }
+    }
+}
+
+/** 调用记录默认不读盘，这个卡片是唯一的读取入口。 */
+@Composable
+private fun LoadCallsCard(onLoad: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
+            Text(
+                "调用记录未加载",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "记录可能较多，需要时再读取。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onLoad, modifier = Modifier.fillMaxWidth()) {
+                Text("加载调用记录")
+            }
+        }
+    }
+}
+
+/** Account section of the 个人信息 page. */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+private fun LazyListScope.credentialItems(
     state: HubState,
     onSwitchRealm: (Wire.Region) -> Unit,
     onSwitchAccount: (String) -> Unit,
@@ -92,108 +197,102 @@ fun CredentialScreen(
     val regionLabel = realmName(region)
     val active = state.credential
     val saved = state.accounts[region].orEmpty()
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        item {
-            Card(onClick = onOpenDetails, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), Arrangement.spacedBy(8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+    item {
+        Card(onClick = onOpenDetails, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "当前账号 · $regionLabel",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        Icons.Default.ChevronRight,
+                        contentDescription = "查看详情",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                when {
+                    active == null -> Text(
+                        "$regionLabel 还没有账号，点下面的按钮登录。",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    else -> {
+                        Text("账号：${active.nickname.ifBlank { active.uid.take(8) }}")
+                        Text("有效期：${state.expiryText.ifBlank { "未知" }}")
                         Text(
-                            "当前账号 · $regionLabel",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.weight(1f),
+                            "点本卡片查看 Token 等完整信息",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
                         )
-                        Icon(
-                            Icons.Default.ChevronRight,
-                            contentDescription = "查看详情",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    when {
-                        active == null -> Text(
-                            "$regionLabel 还没有账号，点下面的按钮登录。",
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        else -> {
-                            Text("账号：${active.nickname.ifBlank { active.uid.take(8) }}")
-                            Text("有效期：${state.expiryText.ifBlank { "未知" }}")
-                            Text(
-                                "点本卡片查看 Token 等完整信息",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                        }
                     }
                 }
             }
         }
+    }
 
-        // Build switch. The dot shows a build has at least one saved account.
-        item {
-            Text("版本", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(6.dp))
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                Wire.Region.entries.forEachIndexed { index, item ->
-                    val count = state.accounts[item].orEmpty().size
-                    SegmentedButton(
-                        selected = region == item,
-                        onClick = { onSwitchRealm(item) },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = Wire.Region.entries.size),
-                    ) {
-                        Text(if (count > 0) "${realmName(item)} $count" else realmName(item))
-                    }
+    // Build switch. The dot shows a build has at least one saved account.
+    item {
+        Text("版本", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            Wire.Region.entries.forEachIndexed { index, item ->
+                val count = state.accounts[item].orEmpty().size
+                SegmentedButton(
+                    selected = region == item,
+                    onClick = { onSwitchRealm(item) },
+                    shape = SegmentedButtonDefaults.itemShape(index = index, count = Wire.Region.entries.size),
+                ) {
+                    Text(if (count > 0) "${realmName(item)} $count" else realmName(item))
                 }
             }
         }
+    }
 
-        // Accounts of the selected build. Selecting one switches the credential
-        // the bridge serves, so switching never requires signing in again.
-        if (saved.isNotEmpty()) {
-            item {
-                Text(
-                    "$regionLabel 账号",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            items(saved, key = { it.id }) { account ->
-                val isActive = account.id == state.activeAccountId
-                AccountRow(
-                    label = account.label,
-                    uid = account.uid,
-                    isActive = isActive,
-                    onSelect = { onSwitchAccount(account.id) },
-                    onDelete = { onDeleteAccount(account.id) },
-                )
-            }
-        }
-
-        item {
-            Button(onClick = { onLogin(region) }, modifier = Modifier.fillMaxWidth()) {
-                Text(if (active == null) "登录 $regionLabel" else "添加 $regionLabel 账号")
-            }
-        }
-
-        if (state.hasAnyCredential) {
-            item {
-                TextButton(onClick = onLogout, modifier = Modifier.fillMaxWidth()) {
-                    Text("退出登录（清除全部账号）")
-                }
-            }
-        }
-
+    // Accounts of the selected build. Selecting one switches the credential
+    // the bridge serves, so switching never requires signing in again.
+    if (saved.isNotEmpty()) {
         item {
             Text(
-                "说明：走官方 CLI 的 OAuth 流程，登录后可拿到 API token（网页 cookie 无法调用接口）。" +
-                    "国内版与国际版是两套独立账号体系，各自可以添加多个账号。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                "$regionLabel 账号",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
             )
         }
+        items(saved, key = { it.id }) { account ->
+            val isActive = account.id == state.activeAccountId
+            AccountRow(
+                label = account.label,
+                uid = account.uid,
+                isActive = isActive,
+                onSelect = { onSwitchAccount(account.id) },
+                onDelete = { onDeleteAccount(account.id) },
+            )
+        }
+    }
+
+    item {
+        Button(onClick = { onLogin(region) }, modifier = Modifier.fillMaxWidth()) {
+            Text(if (active == null) "登录 $regionLabel" else "添加 $regionLabel 账号")
+        }
+    }
+
+    if (state.hasAnyCredential) {
+        item {
+            TextButton(onClick = onLogout, modifier = Modifier.fillMaxWidth()) {
+                Text("退出登录（清除全部账号）")
+            }
+        }
+    }
+
+    item {
+        Text(
+            "说明：走官方 CLI 的 OAuth 流程，登录后可拿到 API token（网页 cookie 无法调用接口）。" +
+                "国内版与国际版是两套独立账号体系，各自可以添加多个账号。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -372,7 +471,7 @@ fun BridgeScreen(
                 Column(Modifier.padding(16.dp), Arrangement.spacedBy(12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            "本地 API 平台",
+                            "局域网转发",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.weight(1f),
@@ -683,9 +782,9 @@ fun BridgeScreen(
     }
 }
 
+/** Points section of the 个人信息 page: check-in, bonus routines and balance. */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class, ExperimentalFoundationApi::class)
-@Composable
-fun RewardsScreen(
+private fun LazyListScope.rewardsItems(
     state: HubState,
     onCheckin: () -> Unit,
     onCheckinAll: () -> Unit,
@@ -695,127 +794,121 @@ fun RewardsScreen(
     onTravel: () -> Unit,
     onNightOwl: () -> Unit,
 ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
-                    Text("每日签到", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Button(
-                        onClick = onCheckin,
-                        enabled = state.loading != Loading.CHECKIN,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            // A long press runs the whole build's accounts, so a
-                            // user with several does not have to tap per account.
-                            .combinedClickable(
-                                onClick = onCheckin,
-                                onLongClick = onCheckinAll,
-                            ),
-                    ) {
-                        if (state.loading == Loading.CHECKIN) {
-                            CircularWavyProgressIndicator(modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("签到中…")
-                        } else {
-                            Text("签到领积分")
-                        }
+    item {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
+                Text("每日签到", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Button(
+                    onClick = onCheckin,
+                    enabled = state.loading != Loading.CHECKIN,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // A long press runs the whole build's accounts, so a
+                        // user with several does not have to tap per account.
+                        .combinedClickable(
+                            onClick = onCheckin,
+                            onLongClick = onCheckinAll,
+                        ),
+                ) {
+                    if (state.loading == Loading.CHECKIN) {
+                        CircularWavyProgressIndicator(modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("签到中…")
+                    } else {
+                        Text("签到领积分")
                     }
                 }
             }
         }
-        item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
-                    Text("自动任务", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+    }
+    item {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
+                Text("自动任务", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "每个按钮独立执行，长按可对全部账号执行",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                BonusButton(
+                    label = "连登管家",
+                    hint = "兑换已解锁档位 + 抽奖 + 补签",
+                    loading = state.loading == Loading.STREAK,
+                    enabled = state.loading == null,
+                    onClick = onStreakBonus,
+                )
+                BonusButton(
+                    label = "活跃上报",
+                    hint = "点亮今日连登",
+                    loading = state.loading == Loading.ACTIVITY,
+                    enabled = state.loading == null,
+                    onClick = onActivityReport,
+                )
+                BonusButton(
+                    label = "猫猫旅行",
+                    hint = "领养 / 派出 / 领取奖励",
+                    loading = state.loading == Loading.TRAVEL,
+                    enabled = state.loading == null,
+                    onClick = onTravel,
+                )
+                BonusButton(
+                    label = "夜猫子",
+                    hint = "23:00–08:00 时段有效",
+                    loading = state.loading == Loading.NIGHT,
+                    enabled = state.loading == null,
+                    onClick = onNightOwl,
+                )
+            }
+        }
+    }
+    item {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "每个按钮独立执行，长按可对全部账号执行",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        "余额",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
                     )
-                    BonusButton(
-                        label = "连登管家",
-                        hint = "兑换已解锁档位 + 抽奖 + 补签",
-                        loading = state.loading == Loading.STREAK,
-                        enabled = state.loading == null,
-                        onClick = onStreakBonus,
-                    )
-                    BonusButton(
-                        label = "活跃上报",
-                        hint = "点亮今日连登",
-                        loading = state.loading == Loading.ACTIVITY,
-                        enabled = state.loading == null,
-                        onClick = onActivityReport,
-                    )
-                    BonusButton(
-                        label = "猫猫旅行",
-                        hint = "领养 / 派出 / 领取奖励",
-                        loading = state.loading == Loading.TRAVEL,
-                        enabled = state.loading == null,
-                        onClick = onTravel,
-                    )
-                    BonusButton(
-                        label = "夜猫子",
-                        hint = "23:00–08:00 时段有效",
-                        loading = state.loading == Loading.NIGHT,
-                        enabled = state.loading == null,
-                        onClick = onNightOwl,
-                    )
-                }
-            }
-        }
-        item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), Arrangement.spacedBy(10.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "余额",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.weight(1f),
-                        )
-                        FilledTonalButton(
-                            onClick = onRefreshBalance,
-                            enabled = state.loading != Loading.BALANCE,
-                        ) {
-                            if (state.loading == Loading.BALANCE) {
-                                CircularWavyProgressIndicator(modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("刷新中")
-                            } else {
-                                Text("刷新")
-                            }
+                    FilledTonalButton(
+                        onClick = onRefreshBalance,
+                        enabled = state.loading != Loading.BALANCE,
+                    ) {
+                        if (state.loading == Loading.BALANCE) {
+                            CircularWavyProgressIndicator(modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("刷新中")
+                        } else {
+                            Text("刷新")
                         }
                     }
-                    val balance = state.balance
-                    when {
-                        state.loading == Loading.BALANCE && balance == null -> {
-                            CircularWavyProgressIndicator()
-                        }
-                        balance == null -> Text("点“刷新”查询余额")
-                        balance.accounts.isEmpty() -> Text("暂无套餐数据")
-                        else -> {
+                }
+                val balance = state.balance
+                when {
+                    state.loading == Loading.BALANCE && balance == null -> {
+                        CircularWavyProgressIndicator()
+                    }
+                    balance == null -> Text("点“刷新”查询余额")
+                    balance.accounts.isEmpty() -> Text("暂无套餐数据")
+                    else -> {
+                        Text(
+                            "可用合计：${balance.total.toLong()}",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        balance.accounts.forEach { acc ->
                             Text(
-                                "可用合计：${balance.total.toLong()}",
-                                style = MaterialTheme.typography.headlineSmall,
-                                color = MaterialTheme.colorScheme.primary,
+                                "${acc.name}：${acc.remain.toLong()} / ${acc.size.toLong()}",
+                                style = MaterialTheme.typography.bodyMedium,
                             )
-                            balance.accounts.forEach { acc ->
-                                Text(
-                                    "${acc.name}：${acc.remain.toLong()} / ${acc.size.toLong()}",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
-                            if (balance.cycleEnd.isNotBlank()) {
-                                Text(
-                                    "周期截止：${balance.cycleEnd}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
+                        }
+                        if (balance.cycleEnd.isNotBlank()) {
+                            Text(
+                                "周期截止：${balance.cycleEnd}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                     }
                 }
@@ -990,23 +1083,13 @@ fun LogoutDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
     )
 }
 
-/** Call history with the usage totals derived from it. */
-@Composable
-fun CallsScreen(
+/** Call history section of the 个人信息 page, with the usage totals derived from it. */
+private fun LazyListScope.callItems(
     state: HubState,
     onClear: () -> Unit,
-    onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenModelStats: () -> Unit,
 ) {
-    // Calls arrive from the service without the UI being told, so the page
-    // reloads while it is on screen rather than only when it is opened.
-    LaunchedEffect(Unit) {
-        while (true) {
-            onRefresh()
-            kotlinx.coroutines.delay(2000L)
-        }
-    }
     // The page follows the account in use: usage is per account, and mixing
     // them would answer neither "how much has this one used" nor "which is
     // nearly spent". The totals and the list are filtered by the same id, so
@@ -1017,82 +1100,60 @@ fun CallsScreen(
     // list below happens to still hold: the list is capped, so deriving the
     // figures from it would make them fall as older calls age out.
     val totals = state.accountTotals.of(accountId)
-    // The pull is a manual reload of what is already on disk; the periodic poll
-    // above keeps the list live, and this exists so a user who has just made a
-    // call does not have to wait for the next tick.
-    var refreshing by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    PullToRefreshBox(
-        isRefreshing = refreshing,
-        onRefresh = {
-            refreshing = true
-            scope.launch {
-                onRefresh()
-                refreshing = false
-            }
-        },
-    ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), Arrangement.spacedBy(8.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "用量统计",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.weight(1f),
-                        )
-                        if (records.isNotEmpty()) {
-                            TextButton(onClick = onClear) { Text("清空") }
-                        }
-                        IconButton(onClick = onOpenSettings) {
-                            Icon(Icons.Default.Settings, contentDescription = "记录设置")
-                        }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        StatCell("成功调用", totals.calls.toString())
-                        StatCell("失败", totals.failures.toString())
-                        StatCell("消耗积分", formatCredits(totals.credits))
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        StatCell("输入 Tokens", totals.promptTokens.toString())
-                        StatCell("输出 Tokens", totals.completionTokens.toString())
-                        StatCell("合计 Tokens", totals.totalTokens.toString())
-                    }
-                }
-            }
-        }
-
-        if (records.isEmpty()) {
-            item {
-                Text(
-                    "这个账号还没有调用记录。通过本地 API 平台发起对话后，这里会显示每次调用的模型、Tokens 与积分消耗。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else {
-            item {
+    item {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        "最近 ${records.size} 次调用（新→旧）",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        "用量统计",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
-                    TextButton(onClick = onOpenModelStats) { Text("模型调用频率") }
+                    if (records.isNotEmpty()) {
+                        TextButton(onClick = onClear) { Text("清空") }
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Default.Settings, contentDescription = "记录设置")
+                    }
                 }
-            }
-            items(records.reversed(), key = { it.timestamp.toString() + it.model }) { record ->
-                CallRow(record, state.models)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    StatCell("成功调用", totals.calls.toString())
+                    StatCell("失败", totals.failures.toString())
+                    StatCell("消耗积分", formatCredits(totals.credits))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    StatCell("输入 Tokens", totals.promptTokens.toString())
+                    StatCell("输出 Tokens", totals.completionTokens.toString())
+                    StatCell("合计 Tokens", totals.totalTokens.toString())
+                }
             }
         }
     }
+
+    if (records.isEmpty()) {
+        item {
+            Text(
+                "这个账号还没有调用记录。通过本地 API 平台发起对话后，这里会显示每次调用的模型、Tokens 与积分消耗。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    } else {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "最近 ${records.size} 次调用（新→旧）",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onOpenModelStats) { Text("模型调用频率") }
+            }
+        }
+        items(records.reversed(), key = { it.timestamp.toString() + it.model }) { record ->
+            CallRow(record, state.models)
+        }
     }
 }
 
@@ -1600,6 +1661,7 @@ fun BridgeAdvancedSheet(
     onToggleResponses: (Boolean) -> Unit,
     onToggleHttps: (Boolean) -> Unit,
     onToggleDisguise: (Boolean) -> Unit,
+    onToggleOverlay: (Boolean) -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -1699,6 +1761,18 @@ fun BridgeAdvancedSheet(
                     )
                 }
                 Switch(checked = state.httpsEnabled, onCheckedChange = onToggleHttps)
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("显示悬浮窗", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "关闭后运行时不再显示「转发中」悬浮窗，通知栏状态仍然保留。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = state.overlayEnabled, onCheckedChange = onToggleOverlay)
             }
         }
     }

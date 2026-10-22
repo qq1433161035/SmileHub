@@ -1,6 +1,7 @@
 package com.wbhub.app.proto
 
 import android.content.Context
+import com.wbhub.app.storage.AppStorage
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -46,8 +47,8 @@ data class SavedAccount(
  */
 class CredentialStore(context: Context) {
 
-    private val dir = context.filesDir
-    private val prefs = context.getSharedPreferences("wb-hub", Context.MODE_PRIVATE)
+    private val dir = AppStorage.credentials(context)
+    private val prefs = AppStorage.prefs(context, "wb-hub")
 
     private fun fileFor(region: Wire.Region): File =
         File(dir, "wb-auth-${region.name.lowercase()}.json")

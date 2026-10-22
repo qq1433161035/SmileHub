@@ -25,7 +25,7 @@ object Notifications {
         manager.createNotificationChannel(
             NotificationChannel(
                 BRIDGE_CHANNEL,
-                "WorkBuddy 转发服务",
+                "SmileHub 转发服务",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply { description = "本地 API 平台运行状态" },
         )
@@ -55,7 +55,7 @@ object Notifications {
         if (!hasPermission(context)) return
         val notification = NotificationCompat.Builder(context, BRIDGE_CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_hub)
-            .setContentTitle("WorkBuddy Hub")
+            .setContentTitle("SmileHub")
             .setContentText("已就绪 · API 平台端口 $port")
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -84,7 +84,7 @@ object Notifications {
     fun buildBridge(context: Context, port: Int) =
         NotificationCompat.Builder(context, BRIDGE_CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_hub)
-            .setContentTitle("WorkBuddy 本地 API 平台")
+            .setContentTitle("SmileHub 本地 API 平台")
             .setContentText("127.0.0.1:$port 运行中")
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -97,7 +97,7 @@ object Notifications {
         val text = if (nickname.isBlank()) "凭证已保存" else "已登录：$nickname"
         val notification = NotificationCompat.Builder(context, LOGIN_CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_hub)
-            .setContentTitle("WorkBuddy 登录成功")
+            .setContentTitle("SmileHub 登录成功")
             .setContentText(text)
             .setAutoCancel(true)
             .setContentIntent(contentIntent(context, EXTRA_OPEN_AFTER_LOGIN))

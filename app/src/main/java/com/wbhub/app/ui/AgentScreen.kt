@@ -1,7 +1,20 @@
 package com.wbhub.app.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.util.Base64
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +28,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -24,6 +38,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
@@ -43,15 +59,24 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.wbhub.app.agent.ApprovalMode
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.window.DialogProperties
 import com.wbhub.app.proto.HubModel
-
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 /**
  * The built-in agent: a transcript, a prompt box, and the settings that shape a
  * request.
@@ -70,13 +95,12 @@ fun AgentScreen(
     onSelectModel: (String) -> Unit,
     onSelectEffort: (String) -> Unit,
     onSelectContext: (Int) -> Unit,
-    onToggleRoot: (Boolean) -> Unit,
-    onSelectApproval: (ApprovalMode) -> Unit,
-    onRequestStorage: () -> Unit,
     onNewSession: () -> Unit,
     onOpenSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
     onAnswerApproval: (Boolean) -> Unit,
+    onStop: () -> Unit,
+    onImagePicked: (String?) -> Unit,
 ) {
     val listState = rememberLazyListState()
     // Follow the newest line as it streams in, which is the only way the tail
@@ -107,12 +131,11 @@ fun AgentScreen(
             onSelectModel = onSelectModel,
             onSelectEffort = onSelectEffort,
             onSelectContext = onSelectContext,
-            onToggleRoot = onToggleRoot,
-            onSelectApproval = onSelectApproval,
-            onRequestStorage = onRequestStorage,
             onNewSession = onNewSession,
             onOpenSession = onOpenSession,
             onDeleteSession = onDeleteSession,
+            onStop = onStop,
+            onImagePicked = onImagePicked,
         )
     }
 
@@ -140,14 +163,26 @@ private fun Composer(
     onSelectModel: (String) -> Unit,
     onSelectEffort: (String) -> Unit,
     onSelectContext: (Int) -> Unit,
-    onToggleRoot: (Boolean) -> Unit,
-    onSelectApproval: (ApprovalMode) -> Unit,
-    onRequestStorage: () -> Unit,
     onNewSession: () -> Unit,
     onOpenSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onStop: () -> Unit,
+    onImagePicked: (String?) -> Unit,
 ) {
     val selected = models.firstOrNull { it.id == agent.modelId }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val dataUrl = withContext(Dispatchers.IO) { imageDataUrl(context, uri) }
+            if (dataUrl != null) {
+                onImagePicked(dataUrl)
+            } else {
+                Toast.makeText(context, "读取图片失败", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -169,7 +204,10 @@ private fun Composer(
                     // A fresh conversation is the action taken most often, so it
                     // belongs at the top of the list rather than beside it.
                     add(NEW_SESSION to "＋ 新会话")
-                    agent.sessions.forEach { add(it.id to it.title) }
+                    agent.sessions.forEach { session ->
+                        val marker = if (session.compaction.compactedMessages > 0) " ·已压缩" else ""
+                        add(session.id to session.title + marker)
+                    }
                 },
                 onSelect = { picked ->
                     if (picked == NEW_SESSION) onNewSession() else onOpenSession(picked)
@@ -201,40 +239,43 @@ private fun Composer(
                     onSelect = { picked -> onSelectContext(picked.toIntOrNull() ?: 0) },
                 )
             }
-            if (agent.rootAvailable) {
-                // Only offered when root was actually granted; a switch that
-                // silently does nothing is worse than no switch.
-                AssistChip(
-                    onClick = { onToggleRoot(!agent.exposeRoot) },
-                    label = { Text(if (agent.exposeRoot) "root 已暴露" else "不给 root") },
-                )
-            }
-            ChipPicker(
-                value = agent.approval.label,
-                options = ApprovalMode.entries.map { it.name to it.label },
-                onSelect = { picked ->
-                    ApprovalMode.entries.firstOrNull { it.name == picked }?.let(onSelectApproval)
-                },
-            )
         }
 
-        Text(
-            agent.approval.description,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        if (!agent.storageGranted) {
-            Text(
-                "未授予所有文件访问权限，点击此处设置",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.clickable(onClick = onRequestStorage),
-            )
+        // 附带的图片先给一眼预览，发送时随消息一起带给模型。
+        agent.pendingImage?.let { dataUrl ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val preview = remember(dataUrl) { previewBitmap(dataUrl) }
+                if (preview != null) {
+                    Image(
+                        bitmap = preview,
+                        contentDescription = "待发送图片",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.size(48.dp),
+                    )
+                }
+                Text(
+                    "图片将随下一条消息发送",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 8.dp),
+                )
+                TextButton(onClick = { onImagePicked(null) }) { Text("移除") }
+            }
         }
 
         // Input and send share one row so the button reads as part of the box.
         Row(verticalAlignment = Alignment.Bottom) {
+            IconButton(
+                onClick = {
+                    imagePicker.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+                modifier = Modifier.size(52.dp),
+            ) {
+                Icon(Icons.Default.Image, contentDescription = "添加图片")
+            }
             OutlinedTextField(
                 value = agent.input,
                 onValueChange = onInputChange,
@@ -245,18 +286,19 @@ private fun Composer(
                 maxLines = 6,
             )
             Spacer(Modifier.width(6.dp))
-            FilledIconButton(
-                onClick = onSend,
-                enabled = !agent.running && agent.input.isNotBlank() && agent.modelId.isNotBlank(),
-                modifier = Modifier.size(52.dp),
-            ) {
-                if (agent.running) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                } else {
+            if (agent.running) {
+                FilledIconButton(
+                    onClick = onStop,
+                    modifier = Modifier.size(52.dp),
+                ) {
+                    Icon(Icons.Default.Stop, contentDescription = "停止")
+                }
+            } else {
+                FilledIconButton(
+                    onClick = onSend,
+                    enabled = (agent.input.isNotBlank() || agent.pendingImage != null) && agent.modelId.isNotBlank(),
+                    modifier = Modifier.size(52.dp),
+                ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
             }
@@ -281,7 +323,16 @@ private fun ChipPicker(
     Box {
         AssistChip(
             onClick = { open = true },
-            label = { Text(value, maxLines = 1) },
+            // 会话标题就是首条提问，可能很长；不截断会把整行撑满、
+            // 把模型/思考等后面的选择器挤出屏幕。
+            label = {
+                Text(
+                    value,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 170.dp),
+                )
+            },
         )
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             options.forEach { (id, name) ->
@@ -306,6 +357,21 @@ private fun ChipPicker(
     }
 }
 
+/** Copies a transcript line and lets the user know it happened. */
+@Composable
+private fun rememberCopyToClipboard(): (String) -> Unit {
+    val context = LocalContext.current
+    return remember(context) {
+        { text ->
+            if (text.isNotBlank()) {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("对话记录", text))
+                Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
 /** One transcript line, styled by who produced it. */
 @Composable
 private fun EntryRow(entry: AgentEntry) {
@@ -314,6 +380,7 @@ private fun EntryRow(entry: AgentEntry) {
         // collapsed into a single line that opens on demand.
         AgentEntry.Role.REASONING,
         AgentEntry.Role.TOOL,
+        AgentEntry.Role.COMPACT,
         -> CollapsibleRow(entry)
 
         else -> MessageRow(entry)
@@ -321,16 +388,23 @@ private fun EntryRow(entry: AgentEntry) {
 }
 
 /** A user or assistant line, always visible. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageRow(entry: AgentEntry) {
     val scheme = MaterialTheme.colorScheme
+    val copy = rememberCopyToClipboard()
     val (title, color) = when (entry.role) {
         AgentEntry.Role.USER -> "你" to scheme.primary
         AgentEntry.Role.ASSISTANT -> "Agent" to scheme.onSurface
         AgentEntry.Role.ERROR -> "错误" to scheme.error
         else -> "" to scheme.onSurface
     }
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            // 长按整条消息复制原文；对话里经常要拿命令或路径去别处用。
+            .combinedClickable(onClick = {}, onLongClick = { copy(entry.text) }),
+    ) {
         Column(Modifier.padding(10.dp), Arrangement.spacedBy(4.dp)) {
             if (title.isNotEmpty()) {
                 Text(title, style = MaterialTheme.typography.labelSmall, color = color, fontWeight = FontWeight.SemiBold)
@@ -341,20 +415,33 @@ private fun MessageRow(entry: AgentEntry) {
 }
 
 /** A reasoning or tool line, folded to one row until it is tapped. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CollapsibleRow(entry: AgentEntry) {
     var expanded by remember(entry.text) { mutableStateOf(false) }
     val scheme = MaterialTheme.colorScheme
+    val copy = rememberCopyToClipboard()
     val isReasoning = entry.role == AgentEntry.Role.REASONING
-    val label = if (isReasoning) "思考" else "工具"
-    val color = if (isReasoning) scheme.onSurfaceVariant else scheme.tertiary
+    val label = when (entry.role) {
+        AgentEntry.Role.REASONING -> "思考"
+        AgentEntry.Role.COMPACT -> "压缩"
+        else -> "工具"
+    }
+    val color = when (entry.role) {
+        AgentEntry.Role.REASONING -> scheme.onSurfaceVariant
+        AgentEntry.Role.COMPACT -> scheme.secondary
+        else -> scheme.tertiary
+    }
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { expanded = !expanded }
+                    .combinedClickable(
+                        onClick = { expanded = !expanded },
+                        onLongClick = { copy(entry.text) },
+                    )
                     .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -431,13 +518,18 @@ private fun formatContext(tokens: Int): String = when {
 /**
  * Asks whether one tool call may proceed.
  *
- * Dismissing counts as a refusal: a dialog that vanishes because the user
- * tapped outside should not authorise a shell command.
+ * Only the two buttons close this: tapping outside or pressing back must not
+ * decide anything, because a vanished dialog used to be read as a refusal and
+ * killed the run.
  */
 @Composable
 private fun ApprovalDialog(summary: String, onAnswer: (Boolean) -> Unit) {
     AlertDialog(
-        onDismissRequest = { onAnswer(false) },
+        onDismissRequest = { },
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+        ),
         title = { Text("允许此操作？") },
         text = {
             Text(
@@ -453,6 +545,33 @@ private fun ApprovalDialog(summary: String, onAnswer: (Boolean) -> Unit) {
 
 /** Sentinel for "thinking off" that is distinct from an unset effort. */
 const val EFFORT_OFF = "off"
+
+/** 读取相册图片，缩到模型够用的尺寸后编成 data URL。 */
+private fun imageDataUrl(context: Context, uri: Uri): String? = runCatching {
+    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+    val maxSide = 1568
+    val scale = minOf(1f, maxSide.toFloat() / maxOf(bitmap.width, bitmap.height))
+    val scaled = if (scale < 1f) {
+        Bitmap.createScaledBitmap(
+            bitmap,
+            (bitmap.width * scale).toInt().coerceAtLeast(1),
+            (bitmap.height * scale).toInt().coerceAtLeast(1),
+            true,
+        )
+    } else {
+        bitmap
+    }
+    val out = ByteArrayOutputStream()
+    scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+    "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+}.getOrNull()
+
+/** 把待发送的 data URL 解成缩略图。 */
+private fun previewBitmap(dataUrl: String): ImageBitmap? = runCatching {
+    val bytes = Base64.decode(dataUrl.substringAfter("base64,", ""), Base64.DEFAULT)
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+}.getOrNull()
 
 /** Sentinel id for "start a new conversation" in the session picker. */
 const val NEW_SESSION = "__new__"

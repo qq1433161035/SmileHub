@@ -30,12 +30,21 @@ import com.wbhub.app.agent.AgentClient
 import com.wbhub.app.agent.AgentStore
 import com.wbhub.app.agent.AgentTools
 import com.wbhub.app.agent.ApprovalMode
+import com.wbhub.app.agent.ArtifactStore
+import com.wbhub.app.agent.CompactionState
+import com.wbhub.app.agent.ContextEngine
 import com.wbhub.app.proto.CheckinOutcome
 import com.wbhub.app.proto.Credential
 import com.wbhub.app.proto.CredentialStore
 import com.wbhub.app.proto.UpstreamClient
 import com.wbhub.app.proto.Wire
 import com.wbhub.app.proto.toHubModel
+import com.wbhub.app.storage.AppStorage
+import com.wbhub.app.tools.ToolingRuntime
+import com.wbhub.app.ui.ToolingArtifact
+import com.wbhub.app.ui.ToolingOperation
+import com.wbhub.app.ui.ToolingProject
+import com.wbhub.app.ui.ToolingProjectDetail
 import com.wbhub.app.ui.AgentEntry
 import com.wbhub.app.ui.AgentState
 import com.wbhub.app.ui.CheckinDialog
@@ -88,20 +97,34 @@ class MainActivity : ComponentActivity() {
     private lateinit var agentStore: AgentStore
 
     /**
-     * Carries an approval answer from the dialog back to the worker thread that
-     * is blocked waiting for it.
-     */
-    private val approvalAnswer = LinkedBlockingQueue<Boolean>()
-
-    /**
      * The exchange so far, kept in the shape the model needs. The visible
      * transcript is a rendering of it, not a substitute: tool calls and their
      * results only exist here.
      */
     private var lastAgentTranscript: List<AgentClient.Message> = emptyList()
 
+    /** 会话被压缩后的摘要状态，随会话一起落盘。 */
+    private var lastCompaction = CompactionState()
+
     /** A login session survives the agent request, so it is not lifecycle-bound. */
     private val agentScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * 正在运行的对话，按会话 id 区分。
+     *
+     * 每个会话各自持有 AgentClient、transcript、压缩状态和可见条目：
+     * 切到别的会话时后台继续跑，输出写回自己的条目，不再覆盖屏幕上的会话。
+     */
+    private class AgentRun(val id: String, var title: String) {
+        val client = AgentClient()
+        var transcript: List<AgentClient.Message> = emptyList()
+        var compaction = CompactionState()
+        var entries: List<AgentEntry> = emptyList()
+        var pendingApproval: String? = null
+        val answers = LinkedBlockingQueue<Boolean>()
+    }
+
+    private val agentRuns = mutableMapOf<String, AgentRun>()
 
     /** Delivers streamed agent events to the main thread. */
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -141,6 +164,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppStorage.init(this)
         store = CredentialStore(this)
         callLog = CallLogStore(this)
         agentStore = AgentStore(this)
@@ -151,7 +175,12 @@ class MainActivity : ComponentActivity() {
         store.mirrorActiveForDaemon()
         loadBalance()
         loadModels()
-        loadCalls()
+        // 调用记录不在启动时读取：条目可能很多，用户进「个人信息」后按需加载。
+        // Create /WBHub/tools and register external tools before the first
+        // prompt, so editing a script does not require opening the 工程 page.
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { ToolingRuntime.get(this@MainActivity) }
+        }
         state = state.copy(
             notificationsAllowed = Notifications.hasPermission(this),
             overlayOpacity = BridgeSettings.opacity(this),
@@ -176,9 +205,14 @@ class MainActivity : ComponentActivity() {
             dotAlpha = BridgeSettings.dotAlpha(this),
             burnInEnabled = BridgeSettings.burnInEnabled(this),
             burnInIntervalMs = BridgeSettings.burnInIntervalMs(this),
+            overlayEnabled = BridgeSettings.overlayEnabled(this),
         )
         // Restored before the model catalogue arrives; a stored model that no
         // longer exists is replaced once the catalogue does.
+        val activeId = agentStore.activeSessionId()
+        val restored = activeId.takeIf { it.isNotEmpty() }?.let { agentStore.load(it) }
+        lastAgentTranscript = restored?.messages ?: emptyList()
+        lastCompaction = restored?.compaction ?: CompactionState()
         agent = agent.copy(
             storageGranted = hasAllFilesAccess(),
             modelId = agentStore.modelId(),
@@ -187,14 +221,25 @@ class MainActivity : ComponentActivity() {
             exposeRoot = agentStore.exposeRoot(),
             workDir = agentStore.workDir().ifEmpty { agent.workDir },
             approval = agentStore.approval(),
+            maxRounds = agentStore.maxRounds(),
+            compactionEnabled = agentStore.compactionEnabled(),
+            compactTrigger = agentStore.compactTrigger(),
+            compactKeepTurns = agentStore.compactKeepTurns(),
+            offloadChars = agentStore.offloadChars(),
             sessions = agentStore.sessions(),
+            sessionId = restored?.id.orEmpty(),
+            sessionTitle = restored?.title.orEmpty(),
+            entries = restored?.entries?.mapNotNull { entry ->
+                val role = runCatching { AgentEntry.Role.valueOf(entry.role) }.getOrNull()
+                    ?: return@mapNotNull null
+                AgentEntry(role, entry.text)
+            }.orEmpty(),
         )
         // Root is probed rather than assumed: the switch is meaningless on a
         // device that never grants it.
         checkRootAvailability()
-        // Starting the bridge from the foreground is what makes the foreground
-        // promotion legal; a later start from a background caller is refused.
-        startBridge(state.port, silent = true)
+        // The endpoint is off by default: it exists for other devices to call,
+        // and starting it behind the user's back also forces a floating panel.
 
         setContent {
             HubApp(
@@ -210,8 +255,15 @@ class MainActivity : ComponentActivity() {
                 onLogin = { region -> startLogin(region) },
                 onLogout = { state = state.copy(showLogoutConfirm = true) },
                 onClearCalls = { clearCalls() },
-                onOpenCallSettings = { state = state.copy(showCallSettings = true) },
-                onOpenModelStats = { state = state.copy(showModelStats = true) },
+                onOpenCallSettings = {
+                    // 设置页要显示占用大小，打开时按需读一次。
+                    if (!state.callsLoaded) loadCalls()
+                    state = state.copy(showCallSettings = true)
+                },
+                onOpenModelStats = {
+                    if (!state.callsLoaded) loadCalls()
+                    state = state.copy(showModelStats = true)
+                },
                 onDismissModelStats = { state = state.copy(showModelStats = false) },
                 onDismissCallSettings = { state = state.copy(showCallSettings = false) },
                 onCallLimitChange = { limit ->
@@ -311,6 +363,11 @@ class MainActivity : ComponentActivity() {
                     // overlay rebuilds itself.
                     BridgeService.overlayRef?.stealthMode = enabled
                 },
+                onToggleOverlay = { enabled ->
+                    BridgeSettings.setOverlayEnabled(this, enabled)
+                    state = state.copy(overlayEnabled = enabled)
+                    service?.applyOverlaySetting()
+                },
                 onDotColor = { color ->
                     BridgeSettings.setDotColor(this, color)
                     state = state.copy(dotColor = color)
@@ -353,6 +410,7 @@ class MainActivity : ComponentActivity() {
                 onNightOwl = { runNightOwl() },
                 onAgentInput = { value -> agent = agent.copy(input = value) },
                 onAgentSend = { sendAgentPrompt() },
+                onAgentImagePicked = { dataUrl -> agent = agent.copy(pendingImage = dataUrl) },
                 onAgentSelectModel = { id ->
                     // Switching models resets the effort and context: the
                     // accepted levels and lengths differ per model, so keeping
@@ -381,7 +439,29 @@ class MainActivity : ComponentActivity() {
                     agentStore.setApproval(mode)
                     agent = agent.copy(approval = mode)
                 },
+                onAgentSelectMaxRounds = { rounds ->
+                    agentStore.setMaxRounds(rounds)
+                    agent = agent.copy(maxRounds = rounds)
+                },
+                onAgentToggleCompaction = { enabled ->
+                    agentStore.setCompactionEnabled(enabled)
+                    agent = agent.copy(compactionEnabled = enabled)
+                },
+                onAgentSelectCompactTrigger = { percent ->
+                    agentStore.setCompactTrigger(percent)
+                    agent = agent.copy(compactTrigger = percent)
+                },
+                onAgentSelectCompactKeep = { turns ->
+                    agentStore.setCompactKeepTurns(turns)
+                    agent = agent.copy(compactKeepTurns = turns)
+                },
+                onAgentSelectOffloadChars = { chars ->
+                    agentStore.setOffloadChars(chars)
+                    agent = agent.copy(offloadChars = chars)
+                },
+                onAgentCompactNow = { compactAgentNow() },
                 onAgentAnswerApproval = { allow -> answerApproval(allow) },
+                onAgentStop = { stopAgent() },
                 onAgentRequestStorage = { requestAllFilesAccess() },
                 onAgentNewSession = { newAgentSession() },
                 onAgentOpenSession = { id -> openAgentSession(id) },
@@ -396,14 +476,14 @@ class MainActivity : ComponentActivity() {
                 showHelp = showHelp,
                 onShowHelp = { showHelp = true },
                 onDismissHelp = { showHelp = false },
+                onOpenTooling = { openTooling() },
+                onCloseTooling = { closeTooling() },
+                onRefreshTooling = { refreshTooling() },
+                onSelectToolingProject = { id -> selectToolingProject(id) },
+                onDeleteToolingProject = { id -> deleteToolingProject(id) },
                 onTabShown = { tab ->
-                    // Reload on entry: the service writes records without the
-                    // UI knowing, so a snapshot taken at startup goes stale.
-                    when (tab) {
-                        HubTab.Calls -> loadCalls()
-                        HubTab.Rewards -> loadBalance()
-                        else -> Unit
-                    }
+                    // 余额随账号变化，进页面时拉一次；调用记录改成手动加载。
+                    if (tab == HubTab.Personal) loadBalance()
                 },
             )
         }
@@ -412,6 +492,18 @@ class MainActivity : ComponentActivity() {
         // The agent's shell works on real files, so the storage switch is asked
         // for up front rather than only when the agent page is first opened.
         if (!hasAllFilesAccess()) mainHandler.postDelayed({ requestAllFilesAccess() }, 800)
+    }
+
+    /**
+     * Saves the conversation when the app leaves the foreground.
+     *
+     * This runs even while a turn is streaming: the visible transcript is worth
+     * keeping, and the model-facing transcript already holds the completed
+     * turns. A background kill otherwise loses everything since the last run.
+     */
+    override fun onStop() {
+        super.onStop()
+        persistAgentSession()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -753,60 +845,190 @@ class MainActivity : ComponentActivity() {
             return
         }
         val prompt = agent.input.trim()
-        if (prompt.isEmpty() || agent.running) return
+        val promptImage = agent.pendingImage
+        if (prompt.isEmpty() && promptImage == null) return
+        // 只发图时给模型一句最小说明，避免某些上游拒绝空文本。
+        val question = prompt.ifEmpty { "请看这张图片。" }
+        // 同一会话一次只跑一条；别的会话可以并行，各自往自己的条目里写。
+        if (agent.sessionId.isNotEmpty() && agentRuns.containsKey(agent.sessionId)) return
 
         val workDir = File(agent.workDir).apply { if (!exists()) mkdirs() }
+        // A conversation is named after its first prompt, and gets its id at the
+        // same moment, so the picker has something to show before it finishes.
+        val sessionId = agent.sessionId.ifEmpty { "s${System.currentTimeMillis()}" }
+        val title = agent.sessionTitle.ifEmpty { agentStore.titleFor(question) }
+        val run = AgentRun(sessionId, title).apply {
+            entries = agent.entries + AgentEntry(
+                AgentEntry.Role.USER,
+                if (promptImage != null) "$question\n（附图）" else question,
+            )
+            transcript = agentHistory()
+            compaction = lastCompaction
+        }
+        agentRuns[sessionId] = run
+        val modelId = agent.modelId
+        val effort = agent.effort.takeIf { it.isNotBlank() }?.takeIf { it != EFFORT_OFF }
+        val approval = agent.approval
+        val maxRounds = agent.maxRounds
+        val contextWindow = agent.contextWindow
         val tools = AgentTools(
             context = this,
             workDir = workDir,
             useRoot = agent.exposeRoot,
+            tooling = ToolingRuntime.get(this).executor,
+            sessionId = sessionId,
         )
-        // A conversation is named after its first prompt, and gets its id at the
-        // same moment, so the picker has something to show before it finishes.
-        val sessionId = agent.sessionId.ifEmpty { "s${System.currentTimeMillis()}" }
-        val title = agent.sessionTitle.ifEmpty { agentStore.titleFor(prompt) }
         agent = agent.copy(
             input = "",
+            pendingImage = null,
             running = true,
             sessionId = sessionId,
             sessionTitle = title,
-            entries = agent.entries + AgentEntry(AgentEntry.Role.USER, prompt),
+            entries = run.entries,
+            pendingApproval = null,
         )
 
         agentScope.launch {
-            val history = agentHistory()
+            val contextEngine = ContextEngine(
+                artifacts = ArtifactStore(this@MainActivity),
+                config = ContextEngine.CompressionConfig(
+                    enabled = agent.compactionEnabled,
+                    triggerRatio = agent.compactTrigger / 100.0,
+                    keepRecentTurns = agent.compactKeepTurns,
+                    contextWindow = contextWindow,
+                    offloadChars = agent.offloadChars,
+                ),
+            )
             // Each model call inside a run is charged on its own, so usage is
             // collected per turn and written to the call log there rather than
             // summed once at the end.
-            val transcript = withContext(Dispatchers.IO) {
-                agentClient.run(
+            val result = withContext(Dispatchers.IO) {
+                run.client.run(
                     credential = credential,
-                    history = history,
+                    history = run.transcript,
                     prompt = prompt,
-                    modelId = agent.modelId,
-                    effort = agent.effort.takeIf { it.isNotBlank() }?.takeIf { it != EFFORT_OFF },
-                    contextWindow = agent.contextWindow,
+                    modelId = modelId,
+                    effort = effort,
+                    contextWindow = contextWindow,
                     tools = tools,
-                    approval = agent.approval,
-                    ask = { summary -> requestApproval(summary) },
+                    approval = approval,
+                    maxRounds = maxRounds,
+                    sessionId = sessionId,
+                    initialCompaction = run.compaction,
+                    contextEngine = contextEngine,
+                    promptImage = promptImage,
+                    ask = { summary -> requestApproval(run, summary) },
                 ) { event ->
                     when (event) {
-                        is AgentClient.Event.Usage -> recordAgentCall(credential, event)
-                        is AgentClient.Event.Failure -> recordAgentFailure(credential, event.message)
+                        is AgentClient.Event.Usage -> recordAgentCall(credential, event, modelId)
+                        is AgentClient.Event.Failure -> recordAgentFailure(credential, event.message, modelId)
                         else -> Unit
                     }
                     // The client calls this from its own thread and cannot
                     // suspend, so the update is posted to the main thread and
                     // the worker moves on without waiting for it.
-                    mainHandler.post { applyAgentEvent(event) }
+                    mainHandler.post { applyAgentEvent(run, event) }
                 }
             }
-            agent = agent.copy(running = false)
-            lastAgentTranscript = transcript
+            run.transcript = result.messages
+            run.compaction = result.compaction
+            // 会话可能已经被删除：那就不要再写回磁盘。
+            val tracked = agentRuns.remove(run.id) != null
+            // 释放可能还在等审批的线程。
+            run.answers.offer(false)
+            if (!tracked) return@launch
+            val visible = agent.sessionId == run.id
+            if (visible) {
+                lastAgentTranscript = result.messages
+                lastCompaction = result.compaction
+                agent = agent.copy(running = false, pendingApproval = null)
+            }
+            persistSession(
+                id = run.id,
+                title = run.title,
+                entries = run.entries,
+                messages = result.messages,
+                compaction = result.compaction,
+                setActive = visible,
+            )
+        }
+    }
+
+    /**
+     * 手动压缩当前会话：忽略触发阈值，至少把最老的一轮摘要掉。
+     *
+     * 与自动压缩共用 [ContextEngine]，因此原文归档、失败降级和协议配对规则完全一致。
+     */
+    private fun compactAgentNow() {
+        if (agent.running) {
+            Toast.makeText(this, "任务正在执行，结束后再压缩", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val credential = state.credential
+        if (credential == null) {
+            Toast.makeText(this, "请先登录", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val sessionId = agent.sessionId
+        if (sessionId.isEmpty() || lastAgentTranscript.isEmpty()) {
+            Toast.makeText(this, "当前会话还没有可压缩的历史", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (agent.modelId.isBlank()) {
+            Toast.makeText(this, "请先选择模型", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val modelId = agent.modelId
+        agentScope.launch {
+            val engine = ContextEngine(
+                artifacts = ArtifactStore(this@MainActivity),
+                config = ContextEngine.CompressionConfig(
+                    enabled = true,
+                    triggerRatio = 0.0,
+                    keepRecentTurns = agent.compactKeepTurns,
+                    contextWindow = agent.contextWindow,
+                    offloadChars = agent.offloadChars,
+                ),
+            )
+            val step = withContext(Dispatchers.IO) {
+                engine.prepare(
+                    messages = lastAgentTranscript,
+                    sessionId = sessionId,
+                    toolsTokens = 0,
+                    state = lastCompaction,
+                    force = true,
+                ) { prompt ->
+                    agentClient.summarize(credential, modelId, prompt) { event ->
+                        if (event is AgentClient.Event.Usage) recordAgentCall(credential, event, modelId)
+                    }
+                }
+            }
+
+            lastAgentTranscript = step.messages
+            lastCompaction = step.state
+
+            val info = step.compaction
+            if (info == null) {
+                Toast.makeText(this@MainActivity, "最近 ${agent.compactKeepTurns} 轮会保留，没有可压缩的内容", Toast.LENGTH_SHORT).show()
+            } else {
+                agent = agent.copy(
+                    entries = agent.entries + AgentEntry(
+                        AgentEntry.Role.COMPACT,
+                        buildString {
+                            append("上下文已压缩：")
+                            append(info.removed)
+                            append(" 条消息 → 摘要 ")
+                            append(info.summaryTokens)
+                            append(" tokens")
+                            if (info.fallback) append("（摘要生成失败，已硬截断）")
+                            info.archivePath?.let { append("\n原文：$it") }
+                        },
+                    ),
+                )
+                Toast.makeText(this@MainActivity, "已压缩 ${info.removed} 条消息", Toast.LENGTH_SHORT).show()
+            }
             persistAgentSession()
-            // The page polls the log while it is visible, but writing here means
-            // it is already current whenever the user switches to it.
-            mainHandler.post { loadCalls() }
         }
     }
 
@@ -817,34 +1039,34 @@ class MainActivity : ComponentActivity() {
      * spender of the same account, so leaving it out would make the totals
      * disagree with the account's actual usage.
      */
-    private fun recordAgentCall(credential: Credential, usage: AgentClient.Event.Usage) {
+    private fun recordAgentCall(credential: Credential, usage: AgentClient.Event.Usage, modelId: String) {
         callLog.append(
             CallRecord(
                 timestamp = System.currentTimeMillis(),
-                model = agent.modelId,
+                model = modelId,
                 outcome = CallRecord.Outcome.OK,
                 promptTokens = usage.promptTokens,
                 completionTokens = usage.completionTokens,
                 credits = usage.credits,
                 accountId = credential.accountId,
                 accountLabel = credential.nickname,
-                multiplier = state.models.firstOrNull { it.id == agent.modelId }?.multiplier ?: -1.0,
+                multiplier = state.models.firstOrNull { it.id == modelId }?.multiplier ?: -1.0,
                 source = CallRecord.Source.AGENT,
             ),
         )
     }
 
     /** Records a turn that failed before it produced usage. */
-    private fun recordAgentFailure(credential: Credential, detail: String) {
+    private fun recordAgentFailure(credential: Credential, detail: String, modelId: String) {
         callLog.append(
             CallRecord(
                 timestamp = System.currentTimeMillis(),
-                model = agent.modelId,
+                model = modelId,
                 outcome = CallRecord.Outcome.FAILED,
                 detail = detail.take(120),
                 accountId = credential.accountId,
                 accountLabel = credential.nickname,
-                multiplier = state.models.firstOrNull { it.id == agent.modelId }?.multiplier ?: -1.0,
+                multiplier = state.models.firstOrNull { it.id == modelId }?.multiplier ?: -1.0,
                 source = CallRecord.Source.AGENT,
             ),
         )
@@ -857,17 +1079,35 @@ class MainActivity : ComponentActivity() {
      * the main thread and then waits: the alternative is threading a callback
      * through the whole turn loop.
      */
-    private fun requestApproval(summary: String): Boolean {
-        mainHandler.post { agent = agent.copy(pendingApproval = summary) }
+    private fun requestApproval(run: AgentRun, summary: String): Boolean {
+        // 丢掉上一轮停止时留下的答案，避免新的审批被直接拒绝。
+        run.answers.clear()
+        run.pendingApproval = summary
+        mainHandler.post {
+            // 后台会话的审批不抢屏幕：等用户切到该会话时再弹。
+            if (agent.sessionId == run.id) agent = agent.copy(pendingApproval = summary)
+        }
         // A bounded wait keeps a dismissed dialog from wedging the run forever;
         // timing out counts as a refusal, which is the safe direction.
-        return runCatching { approvalAnswer.poll(5, TimeUnit.MINUTES) }.getOrNull() ?: false
+        return runCatching { run.answers.poll(5, TimeUnit.MINUTES) }.getOrNull() ?: false
     }
 
     /** Records the user's answer and releases the waiting worker. */
     private fun answerApproval(allow: Boolean) {
+        val run = agentRuns[agent.sessionId] ?: return
+        run.pendingApproval = null
         agent = agent.copy(pendingApproval = null)
-        approvalAnswer.offer(allow)
+        run.answers.offer(allow)
+    }
+
+    /** 停止当前这一轮：断开在途请求，挂起的审批按拒绝处理。 */
+    private fun stopAgent() {
+        val run = agentRuns[agent.sessionId] ?: return
+        run.client.cancel()
+        run.pendingApproval = null
+        agent = agent.copy(pendingApproval = null)
+        // 释放可能正在等审批的线程。
+        run.answers.offer(false)
     }
 
     /** Probes for root off the main thread, then enables the switch if granted. */
@@ -891,32 +1131,76 @@ class MainActivity : ComponentActivity() {
      * and they cannot be derived from each other once tools are involved.
      */
     private fun persistAgentSession() {
-        val id = agent.sessionId
-        if (id.isEmpty() || agent.entries.isEmpty()) return
+        persistSession(
+            id = agent.sessionId,
+            title = agent.sessionTitle,
+            entries = agent.entries,
+            messages = lastAgentTranscript,
+            compaction = lastCompaction,
+            setActive = true,
+        )
+    }
+
+    /**
+     * 写入任意会话。
+     *
+     * 后台会话落盘时不改「当前会话」标记，否则重启后会打开最后结束的那个，
+     * 而不是用户最后看到的那个。
+     */
+    private fun persistSession(
+        id: String,
+        title: String,
+        entries: List<AgentEntry>,
+        messages: List<AgentClient.Message>,
+        compaction: CompactionState,
+        setActive: Boolean,
+    ) {
+        if (id.isEmpty() || entries.isEmpty()) return
         val session = AgentStore.Session(
             id = id,
-            title = agent.sessionTitle,
+            title = title,
             updatedAt = System.currentTimeMillis(),
-            messages = lastAgentTranscript,
-            entries = agent.entries.mapNotNull { entry ->
+            messages = messages,
+            entries = entries.mapNotNull { entry ->
                 val role = when (entry.role) {
                     AgentEntry.Role.USER -> "USER"
                     AgentEntry.Role.ASSISTANT -> "ASSISTANT"
                     AgentEntry.Role.REASONING -> "REASONING"
                     AgentEntry.Role.TOOL -> "TOOL"
+                    AgentEntry.Role.COMPACT -> "COMPACT"
                     AgentEntry.Role.ERROR -> "ERROR"
                 }
                 AgentStore.StoredEntry(role, entry.text)
             },
+            compaction = compaction,
         )
         agentStore.save(session)
+        if (setActive) agentStore.setActiveSessionId(id)
         agent = agent.copy(sessions = agentStore.sessions())
     }
 
     /** Opens a saved conversation, replacing whatever is on screen. */
     private fun openAgentSession(id: String) {
+        if (id == agent.sessionId) return
+        // 该会话还在跑：直接展示它自己的实时条目，并恢复运行状态。
+        val live = agentRuns[id]
+        if (live != null) {
+            lastAgentTranscript = live.transcript
+            lastCompaction = live.compaction
+            agentStore.setActiveSessionId(id)
+            agent = agent.copy(
+                sessionId = id,
+                sessionTitle = live.title,
+                entries = live.entries,
+                pendingImage = null,
+                running = true,
+                pendingApproval = live.pendingApproval,
+            )
+            return
+        }
         val session = agentStore.load(id) ?: return
         lastAgentTranscript = session.messages
+        lastCompaction = session.compaction
         agentStore.setActiveSessionId(id)
         agent = agent.copy(
             sessionId = session.id,
@@ -926,46 +1210,101 @@ class MainActivity : ComponentActivity() {
                     ?: return@mapNotNull null
                 AgentEntry(role, entry.text)
             },
+            pendingImage = null,
+            running = false,
+            pendingApproval = null,
         )
     }
 
     /** Starts a fresh conversation without deleting the saved one. */
     private fun newAgentSession() {
         lastAgentTranscript = emptyList()
+        lastCompaction = CompactionState()
         agentStore.setActiveSessionId("")
         agent = agent.copy(
             entries = emptyList(),
             sessionId = "",
             sessionTitle = "",
             sessions = agentStore.sessions(),
+            pendingImage = null,
+            running = false,
+            pendingApproval = null,
         )
     }
 
     private fun deleteAgentSession(id: String) {
+        // 删掉正在跑的会话：先停掉，否则后台还会把结果写回磁盘。
+        agentRuns.remove(id)?.let { run ->
+            run.client.cancel()
+            run.answers.offer(false)
+        }
         agentStore.delete(id)
         if (agent.sessionId == id) {
             lastAgentTranscript = emptyList()
-            agent = agent.copy(entries = emptyList(), sessionId = "", sessionTitle = "")
+            lastCompaction = CompactionState()
+            agent = agent.copy(
+                entries = emptyList(),
+                sessionId = "",
+                sessionTitle = "",
+                running = false,
+                pendingApproval = null,
+            )
         }
         agent = agent.copy(sessions = agentStore.sessions())
     }
 
-    /** Folds one streamed event into the visible transcript. */
-    private fun applyAgentEvent(event: AgentClient.Event) {
-        val entries = agent.entries.toMutableList()
+    /** Folds one streamed event into the run's own transcript. */
+    private fun applyAgentEvent(run: AgentRun, event: AgentClient.Event) {
+        val entries = run.entries.toMutableList()
+        var persist = false
         when (event) {
             is AgentClient.Event.Text -> appendStreaming(entries, AgentEntry.Role.ASSISTANT, event.delta)
             is AgentClient.Event.Reasoning -> appendStreaming(entries, AgentEntry.Role.REASONING, event.delta)
             is AgentClient.Event.ToolStart -> entries += AgentEntry(AgentEntry.Role.TOOL, "▶ ${event.name}")
-            is AgentClient.Event.ToolEnd ->
+            is AgentClient.Event.ToolEnd -> {
                 entries += AgentEntry(AgentEntry.Role.TOOL, "◀ ${event.name}：${event.summary}")
-            is AgentClient.Event.Failure -> entries += AgentEntry(AgentEntry.Role.ERROR, event.message)
+                // Tool boundaries are the natural save points: they are coarse
+                // enough not to write a file per token, and frequent enough that
+                // a killed process keeps the work up to the last completed call.
+                persist = true
+            }
+            is AgentClient.Event.Compacted -> {
+                entries += AgentEntry(
+                    AgentEntry.Role.COMPACT,
+                    buildString {
+                        append("上下文已压缩：")
+                        append(event.removed)
+                        append(" 条消息 → 摘要 ")
+                        append(event.summaryTokens)
+                        append(" tokens")
+                        if (event.fallback) append("（摘要生成失败，已硬截断）")
+                        event.archivePath?.let { append("\n原文：$it") }
+                    },
+                )
+                persist = true
+            }
+            is AgentClient.Event.Failure -> {
+                entries += AgentEntry(AgentEntry.Role.ERROR, event.message)
+                persist = true
+            }
             // Usage is consumed where the call log is written; the transcript has
             // nothing to show for it.
             is AgentClient.Event.Usage -> Unit
             AgentClient.Event.Done -> Unit
         }
-        agent = agent.copy(entries = entries)
+        run.entries = entries
+        // 只有这个会话正在屏幕上时才刷新 UI；后台的输出留在自己的条目里。
+        if (agent.sessionId == run.id) agent = agent.copy(entries = entries)
+        if (persist) {
+            persistSession(
+                id = run.id,
+                title = run.title,
+                entries = entries,
+                messages = run.transcript,
+                compaction = run.compaction,
+                setActive = false,
+            )
+        }
     }
 
     /**
@@ -987,12 +1326,21 @@ class MainActivity : ComponentActivity() {
     private fun agentHistory(): List<AgentClient.Message> = lastAgentTranscript
 
     private fun clearAgent() {
+        // 退出登录等场景：所有在跑的会话都要停下来。
+        agentRuns.values.forEach { run ->
+            run.client.cancel()
+            run.answers.offer(false)
+        }
+        agentRuns.clear()
         lastAgentTranscript = emptyList()
+        lastCompaction = CompactionState()
         agent = agent.copy(
             entries = emptyList(),
             sessionId = "",
             sessionTitle = "",
             sessions = agentStore.sessions(),
+            running = false,
+            pendingApproval = null,
         )
     }
 
@@ -1125,11 +1473,102 @@ class MainActivity : ComponentActivity() {
         val limit = BridgeSettings.callLogLimit(this)
         state = state.copy(
             calls = callLog.load(),
+            callsLoaded = true,
             accountTotals = callLog.totals(),
             callLogLimit = limit,
             callLogBytes = callLog.estimatedBytes(limit),
         )
     }
+
+    // ------------------------------------------------------------------ //
+    // 工程页
+    // ------------------------------------------------------------------ //
+
+    private fun openTooling() {
+        state = state.copy(showTooling = true)
+        refreshTooling()
+    }
+
+    private fun closeTooling() {
+        state = state.copy(showTooling = false, tooling = state.tooling.copy(selected = null))
+    }
+
+    private fun selectToolingProject(id: String?) {
+        if (id == null) {
+            state = state.copy(tooling = state.tooling.copy(selected = null))
+            return
+        }
+        state = state.copy(tooling = state.tooling.copy(loading = true))
+        lifecycleScope.launch {
+            val detail = withContext(Dispatchers.IO) { toolingDetail(id) }
+            state = state.copy(
+                tooling = state.tooling.copy(
+                    selected = detail,
+                    loading = false,
+                    error = if (detail == null) "项目不存在" else "",
+                ),
+            )
+        }
+    }
+
+    private fun refreshTooling() {
+        val selectedId = state.tooling.selected?.project?.id
+        state = state.copy(tooling = state.tooling.copy(loading = true, error = ""))
+        lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                val db = ToolingRuntime.get(this@MainActivity).db
+                val projects = db.projects(50).map { it.toUi() }
+                projects to selectedId?.let { toolingDetail(it) }
+            }
+            state = state.copy(
+                tooling = state.tooling.copy(
+                    projects = snapshot.first,
+                    selected = snapshot.second,
+                    loading = false,
+                ),
+            )
+        }
+    }
+
+    /** Deletes a project together with its audit rows and workspace files. */
+    private fun deleteToolingProject(id: String) {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                val runtime = ToolingRuntime.get(this@MainActivity)
+                runtime.db.deleteProject(id)
+                runtime.workspace.deleteProject(id)
+            }
+            if (state.tooling.selected?.project?.id == id) {
+                state = state.copy(tooling = state.tooling.copy(selected = null))
+            }
+            refreshTooling()
+            toast("项目已删除")
+        }
+    }
+
+    private fun toolingDetail(id: String): ToolingProjectDetail? {
+        val runtime = ToolingRuntime.get(this)
+        val row = runtime.db.project(id) ?: return null
+        return ToolingProjectDetail(
+            project = row.toUi(),
+            workspace = row.workspace,
+            artifacts = runtime.db.artifacts(id).map {
+                ToolingArtifact(it.kind, it.path, it.size, it.sha256, it.origin)
+            },
+            operations = runtime.db.operations(id).map {
+                ToolingOperation(it.tool, it.status, it.summary, it.startedAt, it.outputRef)
+            },
+        )
+    }
+
+    private fun com.wbhub.app.tooling.ToolingDb.ProjectRow.toUi() = ToolingProject(
+        id = id,
+        name = name,
+        packageName = packageName.orEmpty(),
+        versionName = versionName.orEmpty(),
+        status = status,
+        updatedAt = updatedAt,
+    )
 
     /**
      * Discards the visible history.

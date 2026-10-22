@@ -9,10 +9,14 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialExpressiveTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MotionScheme
@@ -32,6 +36,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.activity.compose.BackHandler
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import com.wbhub.app.agent.ApprovalMode
@@ -74,11 +79,19 @@ fun HubApp(
     onAgentSelectContext: (Int) -> Unit,
     onAgentToggleRoot: (Boolean) -> Unit,
     onAgentSelectApproval: (ApprovalMode) -> Unit,
+    onAgentSelectMaxRounds: (Int) -> Unit,
+    onAgentToggleCompaction: (Boolean) -> Unit,
+    onAgentSelectCompactTrigger: (Int) -> Unit,
+    onAgentSelectCompactKeep: (Int) -> Unit,
+    onAgentSelectOffloadChars: (Int) -> Unit,
+    onAgentCompactNow: () -> Unit,
     onAgentRequestStorage: () -> Unit,
     onAgentNewSession: () -> Unit,
     onAgentOpenSession: (String) -> Unit,
     onAgentDeleteSession: (String) -> Unit,
     onAgentAnswerApproval: (Boolean) -> Unit,
+    onAgentStop: () -> Unit,
+    onAgentImagePicked: (String?) -> Unit,
     agent: AgentState,
     onCopyEndpoint: () -> Unit,
     onCopyModel: (String) -> Unit,
@@ -98,6 +111,7 @@ fun HubApp(
     onToggleResponses: (Boolean) -> Unit,
     onToggleHttps: (Boolean) -> Unit,
     onToggleDisguise: (Boolean) -> Unit,
+    onToggleOverlay: (Boolean) -> Unit,
     onDismissDisguisePrompt: () -> Unit,
     onToggleStealth: (Boolean) -> Unit,
     onDotColor: (Int) -> Unit,
@@ -111,6 +125,11 @@ fun HubApp(
     showHelp: Boolean,
     onShowHelp: () -> Unit,
     onDismissHelp: () -> Unit,
+    onOpenTooling: () -> Unit,
+    onCloseTooling: () -> Unit,
+    onRefreshTooling: () -> Unit,
+    onSelectToolingProject: (String?) -> Unit,
+    onDeleteToolingProject: (String) -> Unit,
     onTabShown: (HubTab) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(0) }
@@ -118,18 +137,39 @@ fun HubApp(
     // which is what keeps the call history current without a restart.
     LaunchedEffect(tab) { onTabShown(HubTab.entries[tab]) }
     var dark by remember { mutableStateOf(false) }
+    // The 工程 page is a full-screen layer; system back should leave it before
+    // it leaves the app.
+    BackHandler(enabled = state.showTooling) { onCloseTooling() }
 
     MaterialExpressiveTheme(
         colorScheme = if (dark) darkColorScheme() else expressiveLightColorScheme(),
         motionScheme = MotionScheme.expressive(),
     ) {
         val background = MaterialTheme.colorScheme.background
+        if (state.showTooling) {
+            Surface(color = background, contentColor = contentColorFor(background)) {
+                ToolingScreen(
+                    state = state.tooling,
+                    onRefresh = onRefreshTooling,
+                    onSelectProject = onSelectToolingProject,
+                    onDeleteProject = onDeleteToolingProject,
+                )
+            }
+        } else {
         Surface(color = background, contentColor = contentColorFor(background)) {
             Scaffold(
+                // 键盘弹出时只压缩内容区：不加这层，窗口会被系统整体上移，
+                // 顶栏直接跑到屏幕外。
+                modifier = Modifier.fillMaxSize().imePadding(),
                 topBar = {
                     TopAppBar(
                         title = {
-                            Text("WorkBuddy Hub", fontWeight = FontWeight.SemiBold)
+                            Text("SmileHub", fontWeight = FontWeight.SemiBold)
+                        },
+                        actions = {
+                            IconButton(onClick = onOpenTooling) {
+                                Icon(Icons.Default.Build, contentDescription = "工程")
+                            }
                         },
                     )
                 },
@@ -174,7 +214,7 @@ fun HubApp(
                     modifier = Modifier.fillMaxSize(),
                 ) { current ->
                     when (current) {
-                        HubTab.Credential -> CredentialScreen(
+                        HubTab.Personal -> PersonalScreen(
                             state = state,
                             onSwitchRealm = onSwitchRealm,
                             onSwitchAccount = onSwitchAccount,
@@ -182,6 +222,17 @@ fun HubApp(
                             onLogin = onLogin,
                             onLogout = onLogout,
                             onOpenDetails = onOpenCredentialDetails,
+                            onCheckin = onCheckin,
+                            onCheckinAll = onCheckinAll,
+                            onRefreshBalance = onRefreshBalance,
+                            onStreakBonus = onStreakBonus,
+                            onActivityReport = onActivityReport,
+                            onTravel = onTravel,
+                            onNightOwl = onNightOwl,
+                            onClearCalls = onClearCalls,
+                            onRefreshCalls = onRefreshCalls,
+                            onOpenCallSettings = onOpenCallSettings,
+                            onOpenModelStats = onOpenModelStats,
                         )
                         HubTab.Bridge -> BridgeScreen(
                             state = state,
@@ -218,35 +269,29 @@ fun HubApp(
                             onSelectModel = onAgentSelectModel,
                             onSelectEffort = onAgentSelectEffort,
                             onSelectContext = onAgentSelectContext,
-                            onToggleRoot = onAgentToggleRoot,
-                            onSelectApproval = onAgentSelectApproval,
-                            onRequestStorage = onAgentRequestStorage,
                             onNewSession = onAgentNewSession,
                             onOpenSession = onAgentOpenSession,
                             onDeleteSession = onAgentDeleteSession,
                             onAnswerApproval = onAgentAnswerApproval,
+                            onStop = onAgentStop,
+                            onImagePicked = onAgentImagePicked,
                         )
-                        HubTab.Calls -> CallsScreen(
-                            state = state,
-                            onClear = onClearCalls,
-                            onRefresh = onRefreshCalls,
-                            onOpenSettings = onOpenCallSettings,
-                            onOpenModelStats = onOpenModelStats,
-                        )
-                        HubTab.Rewards -> RewardsScreen(
-                            state = state,
-                            onCheckin = onCheckin,
-                            onCheckinAll = onCheckinAll,
-                            onRefreshBalance = onRefreshBalance,
-                            onStreakBonus = onStreakBonus,
-                            onActivityReport = onActivityReport,
-                            onTravel = onTravel,
-                            onNightOwl = onNightOwl,
+                        HubTab.Settings -> SettingsScreen(
+                            agent = agent,
+                            onSelectApproval = onAgentSelectApproval,
+                            onSelectMaxRounds = onAgentSelectMaxRounds,
+                            onToggleCompaction = onAgentToggleCompaction,
+                            onSelectCompactTrigger = onAgentSelectCompactTrigger,
+                            onSelectCompactKeep = onAgentSelectCompactKeep,
+                            onSelectOffloadChars = onAgentSelectOffloadChars,
+                            onCompactNow = onAgentCompactNow,
+                            onToggleRoot = onAgentToggleRoot,
+                            onRequestStorage = onAgentRequestStorage,
                         )
                     }
                 }
-                }
             }
+        }
         }
 
         if (state.checkinMessage.isNotBlank()) {
@@ -275,6 +320,7 @@ fun HubApp(
                 onToggleResponses = onToggleResponses,
                 onToggleHttps = onToggleHttps,
                 onToggleDisguise = onToggleDisguise,
+                onToggleOverlay = onToggleOverlay,
             )
         }
         if (state.showDisguisePrompt) {
@@ -296,6 +342,7 @@ fun HubApp(
                 onDismiss = onDismissHelp,
                 onCopyEndpoint = onCopyEndpoint,
             )
+        }
         }
     }
 }

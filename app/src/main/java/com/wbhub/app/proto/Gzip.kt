@@ -58,7 +58,22 @@ object Gzip {
         if (!encoded.compressed) return send(plain, false)
 
         val first = send(encoded.bytes, true)
-        if (first.accepted || !looksLikeRejectedEncoding(first.status, first.errorBody)) {
+        if (first.accepted) return first
+        // Status 0 means no readable response at all. A gateway that cannot
+        // decode the body sometimes closes the connection instead of answering
+        // 400, so this is treated as a possible encoding rejection once; the
+        // plain retry below either succeeds or fails on its own merits.
+        if (first.status == 0) {
+            val retried = send(plain, false)
+            // Only blame the encoding when the clear request actually worked;
+            // a plain network outage should not disable compression for good.
+            if (retried.accepted) {
+                noteCompressionRefused(region)
+                Log.w(TAG, "no response to a gzip body; retrying in the clear for $region")
+            }
+            return retried
+        }
+        if (!looksLikeRejectedEncoding(first.status, first.errorBody)) {
             return first
         }
 

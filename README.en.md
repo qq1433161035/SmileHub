@@ -1,6 +1,8 @@
-# WorkBuddy Hub Android
+# SmileHub
 
 English | [中文](./README.md)
+
+> Author: weixiao (微笑)
 
 Connect a WorkBuddy account to any OpenAI-compatible client. The app runs a
 local forwarding endpoint on your phone; point your editor, agent, or script at
@@ -8,7 +10,7 @@ it and it works — no official API, and no computer required.
 
 ```
 Phone
-├─ WB Hub
+├─ SmileHub
 │    ├─ OAuth sign-in (China / Global)
 │    ├─ Local forwarding endpoint  127.0.0.1:8765
 │    └─ Overlay status panel (keeps the process from being frozen)
@@ -32,6 +34,15 @@ Phone
 - **Call history**: every call's model, token counts, and credit cost, with
   totals
 - **Check-in and balance**: view remaining credit and claim the daily check-in
+- **Built-in agent**: read/write files, run shell and Python, and drive the
+  reverse-engineering and device tools from the chat page; sessions run
+  concurrently, with context compaction and stream-resume for long tasks
+- **Multimodal**: attach an image from the gallery or hand over a path — the
+  model actually sees it
+
+The list above is only an overview. Multimodal input, concurrent sessions, the
+built-in agent toolchain, reverse engineering, ADB, and the Python runtime are
+documented in full in [docs/FEATURES.md](./docs/FEATURES.md).
 
 ## Build
 
@@ -129,6 +140,70 @@ The upstream endpoints are the private ones the WorkBuddy client uses, not a
 public API. An upstream change can break the integration and would need
 matching work here.
 
+## Tech stack and dependencies
+
+Build: AGP 8.9.1 · Gradle 8.11.1 · Kotlin 2.0.21 · JDK 21 · compileSdk 35 ·
+minSdk 26 · targetSdk 28 · arm64-v8a only.
+
+### UI and foundation
+
+| Library | Version | Purpose |
+| --- | --- | --- |
+| Kotlin | 2.0.21 | Language and coroutines |
+| Jetpack Compose BOM | 2025.05.00 | ui / foundation / animation / ui-tooling-preview |
+| Material3 | 1.4.0-alpha18 | Material You components |
+| material-icons-extended | via Compose BOM | Icons |
+| activity-compose | 1.10.1 | Activity + Compose integration |
+| AndroidX Core / Lifecycle | transitive | Notifications, FileProvider, lifecycle |
+
+### Networking, protocol and security
+
+| Library | Version | Purpose |
+| --- | --- | --- |
+| Conscrypt Android | 2.5.3 | TLS 1.3 `exportKeyingMaterial` for ADB pairing |
+| BouncyCastle bcprov / bcpkix | 1.78.1 | Local certificates, ADB keys, signing keys |
+| libadb-android | 3.1.1 (JitPack) | On-device ADB client and wireless pairing |
+| HttpURLConnection (system) | — | Upstream requests and local forwarding |
+
+### Reverse-engineering engine (`:engine`)
+
+| Library | Version | Purpose |
+| --- | --- | --- |
+| apktool-lib | 2.10.0-wbhub.jar | APK decode / rebuild |
+| brut.j.common / brut.j.util / brut.j.dir | 2.10.0 | apktool runtime |
+| xpp3 | 1.1.6 | XML parsing |
+| Guava | 33.3.0-android | apktool dependency |
+| commons-lang3 / commons-io / commons-text | 3.17.0 / 2.16.1 / 1.12.0 | Utilities |
+| apksig | 8.9.1 | APK signing and verification |
+| smali / smali-baksmali | 3.0.8 | DEX disassembly / assembly |
+| jadx-core / jadx-dex-input / jadx-input-api / jadx-zip | 1.5.6 | DEX to Java decompilation |
+| slf4j-nop | 2.0.18 | No-op logger for jadx |
+| gson | 2.14.0 | SO / ELF structure serialisation |
+| Capstone | prebuilt `libwbcapstone.so` | SO disassembly |
+| aapt2 / zipalign | Android build-tools | Resource compilation, APK alignment (`lib*_exec.so`) |
+
+### Python runtime
+
+| Library | Version | Purpose |
+| --- | --- | --- |
+| Chaquopy | 17.1.0 | Embed CPython in the APK |
+| CPython | 3.12 | The agent's `python` tool, standard library only |
+
+All libraries remain under their respective licenses; follow each project's
+terms when redistributing.
+
+## References
+
+- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)
+- [xc3qaq/WorkBuddy-Hub-Android](https://github.com/xc3qaq/WorkBuddy-Hub-Android)
+
+Thanks to both projects for reference on protocol adaptation and design.
+
+## Author
+
+- weixiao (微笑)
+- QQ: 791940981
+
 ## Known limitations
 
 - Overlay keep-alive depends on how the system judges importance; aggressive
@@ -147,6 +222,11 @@ matching work here.
   this project is the user's own responsibility
 - This project is not affiliated with, authorized by, or endorsed by Tencent or
   WorkBuddy; names are used only to describe compatibility
+
+## Maintenance
+
+Build, release, layout, troubleshooting and known debt:
+[docs/MAINTENANCE.md](./docs/MAINTENANCE.md).
 
 ## License
 
