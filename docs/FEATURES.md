@@ -3,6 +3,8 @@
 按“用户能用到什么”来写，关键参数与阈值一并列出；代码结构与维护见
 [MAINTENANCE.md](./MAINTENANCE.md)。
 
+演示视频（B 站）：[对开源项目的二次封装](https://www.bilibili.com/video/BV1tKnp6FE7n)
+
 ## 1. 四个页面
 
 | 页面 | 作用 |
@@ -174,14 +176,61 @@ Agent 不是“带历史记录的聊天框”，而是一个能连续调用工�
 - 应用：`package_info`、`app_list`、`app_permissions`、`app_launch`、`app_stop`、`app_grant`、`app_debug`
 - 设备：`logcat`、`adb_status`、`adb_connect`、`adb_shell`
 
-### 5.3 工具扩展
+### 5.3 自扩展：缺什么就下载什么
 
-- **外部工具**：`/sdcard/WBHub/tools/<名称>/tool.json` + 脚本，声明参数、风险等级、是否用 root；应用会自动注册为可调用工具。
-- **下载扩展**：
-  - `tools/bin`：可执行文件，位于 `PATH` 首位，可直接按名字调用
-  - `tools/py_modules`、`tools/site-packages`：纯 Python 包，解压即可 `import`
-  - `tools/lib`：共享库
-- **Python 插件**：工作区的 `.py` 可通过 `python { path, args }` 反复调用，支持 `sys.argv` 与 `__file__`。
+内置工具只覆盖常见路径。真正缺能力时，Agent 可以在运行过程中自己补齐，而不是
+回答“不支持”。这是本项目与“固定工具集”最大的区别。
+
+**能下载什么、放到哪、怎么用**
+
+| 下载内容 | 目标位置 | 之后如何调用 |
+| --- | --- | --- |
+| 可执行文件（busybox、自编译 CLI、静态链接工具） | `download` 的 `path` 写 `tools/bin/<名字>`，实际落在应用私有目录 `files/WBHub/bin/` | `bash` 的 `PATH` 首位，直接按名字执行；下载后自动 `chmod +x` |
+| 纯 Python 包（zip / wheel 解包） | `tools/py_modules/` 或 `tools/site-packages/`，配合 `unzip: true` | `python` 工具已把这两个目录加入 `sys.path`，直接 `import` |
+| 普通文件、脚本、样本 | `/sdcard/WBHub/` 工作区任意路径 | `read`、`write`、`bash`、`python` 直接使用 |
+| 外部工具定义 | `/sdcard/WBHub/tools/<名称>/tool.json` + 入口脚本 | 自动注册为模型可调用的工具，新增或修改后下次调用即生效 |
+
+**为什么可执行文件必须放私有目录**
+
+- Android 10+ 对 `/sdcard` 挂载 `noexec`，下载到那里的 ELF 无法执行；
+- 本项目 `targetSdk 28`，应用私有目录允许直接 exec（与 Termux 的做法一致）；
+- 所以 `download` 的 `path` 以 `tools/` 开头时会落到 `files/WBHub/`，其余才写
+  工作区；两个根目录之外一律拒绝。
+
+**下载后如何被调用**
+
+- **`bash`**：`<私有>/bin` 与 `<工作区>/bin` 排在 `PATH` 最前，下载完可以直接
+  `mytool --version`；开启 root 后自动走 `su -c`。
+- **`python`**：`sys.path` 依次包含私有目录与工作区的 `py_modules`、`site-packages`，
+  zip 解开即可 import，不需要安装 pip。
+- **脚本**：`.py` 用 `python { path, args }` 反复调用，支持 `sys.argv` 与 `__file__`；
+  `.sh` 用 `bash` 调用。
+- **持久化**：文件留在设备上，重启应用后仍在；用户也可以用文件管理器手工投放，
+  效果相同。
+
+**注册成原生工具（可选）**
+
+`/sdcard/WBHub/tools/<名称>/tool.json` 可声明 `name`、`description`、`entry`、
+`properties`、`required`、`risk`、`root`、`timeout_seconds`、`max_output_bytes`。
+入口脚本从 stdin、`WB_ARGS`、`WB_ARG_<NAME>` 三种方式拿到参数，stdout 回给模型，
+stderr 作为诊断。应用首次运行会自动生成 `hello` 与 `apk_summary` 两个示例；
+自定义工具不能与内置工具重名。
+
+**典型用法**
+
+- “把 jadx CLI 下载到 `tools/bin`，然后反编译这个 APK”
+- “把这个 zip 解压到 `tools/py_modules`，再用 python 调用里面的库”
+- “缺 ffmpeg 就下载一个 arm64 静态版，转完这段视频”
+- “写个 `tool.json` 把这段脚本注册成工具，以后直接调用”
+
+**边界**
+
+- 下载与执行默认都走审批（“自动判断”模式下会询问）；仅支持 http(s)。
+- 只能写入工作区或私有目录，zip 解压带 Zip Slip 防护。
+- 下载的 ELF 必须是 arm64-v8a、面向 Android bionic 构建；glibc 程序无法运行。
+- `ctypes` / `cffi` 被禁用，Python 不能直接加载下载的 `.so`；要反汇编请用内置的
+  `so_info` / `so_disassemble`。
+- 需要系统特权的操作仍受 Android 权限与 root 状态限制。
 
 ## 6. 逆向能力
 
@@ -219,7 +268,7 @@ Agent 不是“带历史记录的聊天框”，而是一个能连续调用工�
 | 内容 | 位置 |
 | --- | --- |
 | 工作区（可执行扩展、下载、脚本） | `/sdcard/WBHub/` |
-| 私有工具目录（`bin`/`lib`/`py_modules`/`site-packages`） | `/data/data/com.wbhub.app/files/WBHub/` |
+| 私有工具目录（`bin`/`py_modules`/`site-packages`/`downloads`） | `/data/data/com.wbhub.app/files/WBHub/` |
 | 会话与压缩归档 | `/sdcard/WBHub/agent/sessions/` |
 | 调用记录 | `/sdcard/WBHub/records/` |
 | 凭据、ADB 密钥、证书、设置 | `/sdcard/WBHub/{credentials,adb,certificates,settings}/` |

@@ -19,6 +19,10 @@
      └─ baseUrl = http://127.0.0.1:8765/v1
 ```
 
+## 演示
+
+B 站演示视频：[对开源项目的二次封装](https://www.bilibili.com/video/BV1tKnp6FE7n)
+
 ## 功能
 
 - **账号接入**：走官方 CLI 的 OAuth 流程取凭证，登录一次即可长期使用，Token 过期
@@ -34,9 +38,11 @@
 - **内置 Agent**：对话页可读写文件、执行 shell/Python、调用逆向与设备工具，
   多会话可并行，长任务有上下文压缩与断流续写
 - **多模态**：相册选图或直接给图片路径，模型都能真正“看到”图
+- **自扩展工具箱**：内置工具不够用时，Agent 可自行下载可执行文件、Python 包或
+  脚本，落到指定目录后直接调用，无需等待版本更新
 
-以上只是概览。多模态、多会话并发、内置 Agent 工具链、逆向/ADB/Python 运行时等
-完整能力清单见 [docs/FEATURES.md](./docs/FEATURES.md)。
+以上只是概览。多模态、多会话并发、内置 Agent 工具链、自扩展机制、逆向/ADB/Python
+运行时等完整能力清单见 [docs/FEATURES.md](./docs/FEATURES.md)。
 
 ## 构建
 

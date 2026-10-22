@@ -19,6 +19,10 @@ Phone
      └─ baseUrl = http://127.0.0.1:8765/v1
 ```
 
+## Demo
+
+Bilibili walkthrough: [对开源项目的二次封装](https://www.bilibili.com/video/BV1tKnp6FE7n)
+
 ## Features
 
 - **Account access** through the official CLI's OAuth flow — sign in once and the
@@ -39,10 +43,13 @@ Phone
   concurrently, with context compaction and stream-resume for long tasks
 - **Multimodal**: attach an image from the gallery or hand over a path — the
   model actually sees it
+- **Self-extending toolbox**: when a built-in tool is not enough, the agent
+  downloads executables, Python packages, or scripts into dedicated
+  directories and calls them right away — no app update needed
 
 The list above is only an overview. Multimodal input, concurrent sessions, the
-built-in agent toolchain, reverse engineering, ADB, and the Python runtime are
-documented in full in [docs/FEATURES.md](./docs/FEATURES.md).
+built-in agent toolchain, self-extension, reverse engineering, ADB, and the
+Python runtime are documented in full in [docs/FEATURES.md](./docs/FEATURES.md).
 
 ## Build
 
