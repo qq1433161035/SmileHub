@@ -56,17 +56,30 @@ android {
 
     buildFeatures {
         compose = true
+        aidl = true
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8：压缩、混淆、资源裁剪。keep 规则集中在 app/proguard-rules.pro。
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             // Attached only when the keystore was found; otherwise the release
             // artifact stays unsigned instead of failing the build.
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+    }
+
+    lint {
+        // targetSdk 28 是刻意选择：低于 29 才能绕过 W^X 执行私有目录 ELF。
+        // Play 的目标 API 检查不适用于这个自用构建。
+        disable += "ExpiredTargetSdkVersion"
     }
 
     packaging {

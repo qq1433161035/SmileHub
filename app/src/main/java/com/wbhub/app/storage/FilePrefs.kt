@@ -18,18 +18,37 @@ class FilePrefs(private val file: File) : SharedPreferences {
     private val values = LinkedHashMap<String, Any?>()
     private val listeners = CopyOnWriteArraySet<SharedPreferences.OnSharedPreferenceChangeListener>()
 
+    /** 文件版本戳（修改时间 + 长度），用于发现另一个进程写入了新值。 */
+    private var stamp: Long = -1L
+
     init {
         file.parentFile?.mkdirs()
         load()
     }
 
+    private fun fileStamp(): Long =
+        if (file.isFile) file.lastModified() * 31 + file.length() else -1L
+
     @Synchronized
     private fun load() {
-        if (!file.isFile) return
-        runCatching {
-            val json = JSONObject(file.readText())
-            json.keys().forEach { key -> fromJson(json.get(key))?.let { values[key] = it } }
+        values.clear()
+        if (file.isFile) {
+            runCatching {
+                val json = JSONObject(file.readText())
+                json.keys().forEach { key -> fromJson(json.get(key))?.let { values[key] = it } }
+            }
         }
+        stamp = fileStamp()
+    }
+
+    /**
+     * 两个进程各有一份内存缓存；读之前先看文件是否被对方改过。
+     * 不重载的话，`:tools` 会一直用旧开关值，直到进程重启。
+     */
+    @Synchronized
+    private fun refreshIfChanged() {
+        val current = fileStamp()
+        if (current != stamp) load()
     }
 
     private fun fromJson(value: Any?): Any? = when (value) {
@@ -54,12 +73,19 @@ class FilePrefs(private val file: File) : SharedPreferences {
             file.writeText(text)
             tmp.delete()
         }
+        stamp = fileStamp()
     }
 
     @Synchronized
-    private fun value(key: String?): Any? = values[key]
+    private fun value(key: String?): Any? {
+        refreshIfChanged()
+        return values[key]
+    }
 
-    override fun getAll(): MutableMap<String, *> = synchronized(this) { LinkedHashMap(values) }
+    override fun getAll(): MutableMap<String, *> = synchronized(this) {
+        refreshIfChanged()
+        LinkedHashMap(values)
+    }
 
     override fun getString(key: String?, defValue: String?): String? = value(key) as? String ?: defValue
 
@@ -77,7 +103,10 @@ class FilePrefs(private val file: File) : SharedPreferences {
     override fun getBoolean(key: String?, defValue: Boolean): Boolean =
         value(key) as? Boolean ?: defValue
 
-    override fun contains(key: String?): Boolean = synchronized(this) { values.containsKey(key) }
+    override fun contains(key: String?): Boolean = synchronized(this) {
+        refreshIfChanged()
+        values.containsKey(key)
+    }
 
     override fun edit(): SharedPreferences.Editor = Editor()
 
@@ -142,6 +171,8 @@ class FilePrefs(private val file: File) : SharedPreferences {
 
         override fun commit(): Boolean {
             synchronized(this@FilePrefs) {
+                // 先合并另一个进程刚写入的键，避免整文件覆盖把对方的修改抹掉。
+                refreshIfChanged()
                 if (cleared) values.clear()
                 removals.forEach { values.remove(it) }
                 changes.forEach { (key, value) ->

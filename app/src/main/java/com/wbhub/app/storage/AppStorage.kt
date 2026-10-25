@@ -27,54 +27,80 @@ object AppStorage {
     const val DIR_LOGS = "logs"
     const val DIR_TOOLS = "tools"
     const val DIR_LIBS = "libs"
+    const val DIR_SECRETS = "secrets"
+    const val DIR_ADB = "adb"
+    const val DIR_MEMORY = "memory"
 
     private const val ROOT_NAME = "WBHub"
-    private const val MIGRATION_MARKER = ".migration-v1"
 
     private val prefCache = ConcurrentHashMap<String, FilePrefs>()
 
-    @Volatile
-    private var initialised = false
-
-    /** Must run before any store is constructed. Safe to call repeatedly. */
-    @Synchronized
-    fun init(context: Context) {
-        if (initialised) return
-        initialised = true
-        val app = context.applicationContext
-        val rootDir = root(app)
-        val marker = File(rootDir, MIGRATION_MARKER)
-        if (marker.exists()) return
-        val result = runCatching { migrateLegacy(app) }
-        result.exceptionOrNull()?.let {
-            android.util.Log.w("WBHub", "storage migration incomplete", it)
-        }
-        if (result.isSuccess) {
-            runCatching { marker.writeText("1") }
-        }
-    }
-
     fun root(context: Context): File {
         val shared = File(Environment.getExternalStorageDirectory(), ROOT_NAME)
-        if (shared.isDirectory || shared.mkdirs() || shared.canWrite()) return shared
+        // 只有“存在且可写”才用共享目录。仅判断存在会在撤权后静默丢设置。
+        if ((shared.isDirectory || shared.mkdirs()) && shared.canWrite()) return shared
         // No all-files access: stay on internal storage rather than failing.
         return File(context.filesDir, ROOT_NAME).apply { mkdirs() }
+    }
+
+    /** 先写临时文件再 rename，避免进程被杀时留下截断的 JSON。 */
+    fun writeAtomically(file: File, text: String) {
+        file.parentFile?.mkdirs()
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        tmp.writeText(text)
+        if (!tmp.renameTo(file)) {
+            file.writeText(text)
+            tmp.delete()
+        }
     }
 
     fun dir(context: Context, path: String): File =
         File(root(context), path).apply { mkdirs() }
 
+    /**
+     * 凭据、ADB 私钥、TLS CA 私钥的存放根目录。
+     *
+     * 这些文件不能放在 `/sdcard`：那里的内容任何具备存储权限的应用都能读。
+     * 位置固定在应用私有目录，不再从共享存储迁移。
+     */
+    fun secrets(context: Context): File =
+        File(context.filesDir, ROOT_NAME).resolve(DIR_SECRETS).apply { mkdirs() }
+
+    private fun secretDir(context: Context, name: String): File =
+        File(secrets(context), name).apply { mkdirs() }
+
     fun settings(context: Context): File = dir(context, DIR_SETTINGS)
-    fun credentials(context: Context): File = dir(context, DIR_CREDENTIALS)
-    fun certificates(context: Context): File = dir(context, DIR_CERTIFICATES)
+
+    /**
+     * 仅应用可写的设置目录。
+     *
+     * 共享存储里的 JSON 任何具备存储访问能力的应用都能改写；提示词一旦被改，
+     * 等于给每次模型请求注入指令，所以这类值单独放在私有目录，只由设置页编辑。
+     */
+    fun privateSettings(context: Context): File =
+        File(context.filesDir, ROOT_NAME).resolve(DIR_SETTINGS).apply { mkdirs() }
+
+    fun credentials(context: Context): File = secretDir(context, DIR_CREDENTIALS)
+    fun certificates(context: Context): File = secretDir(context, DIR_CERTIFICATES)
+    fun adb(context: Context): File = secretDir(context, DIR_ADB)
     fun records(context: Context): File = dir(context, DIR_RECORDS)
     fun sessions(context: Context): File = dir(context, DIR_SESSIONS)
-    fun keys(context: Context): File = dir(context, DIR_KEYS)
+    /** 签名密钥与凭据同级：共享存储里的 p12 任何应用都能复制。 */
+    fun keys(context: Context): File = File(secrets(context), DIR_KEYS).apply { mkdirs() }
     fun database(context: Context): File = dir(context, DIR_DATABASE)
     fun workspace(context: Context): File = dir(context, DIR_WORKSPACE)
     fun logs(context: Context): File = dir(context, DIR_LOGS)
     fun tools(context: Context): File = dir(context, DIR_TOOLS)
     fun libs(context: Context): File = dir(context, DIR_LIBS)
+
+    /**
+     * 长期记忆库。
+     *
+     * 放在私有目录而不是共享存储：记忆里会有用户偏好和项目细节，
+     * 不应该被其他应用读到。
+     */
+    fun memory(context: Context): File =
+        File(context.filesDir, ROOT_NAME).resolve(DIR_MEMORY).apply { mkdirs() }
 
     /** Preferences backed by a JSON file under settings/, not by /data/data. */
     fun prefs(context: Context, name: String): FilePrefs {
@@ -82,28 +108,9 @@ object AppStorage {
         return prefCache.getOrPut(file.absolutePath) { FilePrefs(file) }
     }
 
-    // ------------------------------------------------------------------ //
-    // One-time move of everything the previous builds wrote into private
-    // storage. Originals are left in place so a failed copy loses nothing.
-    // ------------------------------------------------------------------ //
-
-    /**
-     * Only the account survives the move. Sessions, call logs, the project
-     * database, signing keys, certificates, workspace files and every setting
-     * are deliberately left behind so the new layout starts clean and the user
-     * configures it once.
-     */
-    private fun migrateLegacy(context: Context) {
-        context.filesDir.listFiles()?.forEach { file ->
-            if (file.isFile && file.name.startsWith("wb-auth-")) {
-                copy(file, credentials(context))
-            }
-        }
-    }
-
-    private fun copy(source: File, targetDir: File) {
-        val target = File(targetDir, source.name)
-        if (target.exists()) return
-        runCatching { source.copyTo(target, overwrite = false) }
+    /** 私有目录里的 preferences：外部应用不可读写。 */
+    fun privatePrefs(context: Context, name: String): FilePrefs {
+        val file = File(privateSettings(context), "$name.json")
+        return prefCache.getOrPut(file.absolutePath) { FilePrefs(file) }
     }
 }

@@ -156,7 +156,6 @@ class CallLogStore(private val context: Context) {
 
     private val file = File(AppStorage.records(context), "wb-call-log.json")
     private val totalsFile = File(AppStorage.records(context), "wb-call-totals.json")
-    private val lock = Any()
 
     /**
      * Reads the running totals per account.
@@ -207,7 +206,7 @@ class CallLogStore(private val context: Context) {
      * record, and a user tidying the view is not asking to lose the record.
      */
     fun clearTotals() {
-        synchronized(lock) { runCatching { totalsFile.delete() } }
+        synchronized(FILE_LOCK) { runCatching { totalsFile.delete() } }
     }
 
     /**
@@ -217,7 +216,7 @@ class CallLogStore(private val context: Context) {
      * than deferred until the next call arrives.
      */
     fun trimToLimit() {
-        synchronized(lock) {
+        synchronized(FILE_LOCK) {
             val limit = BridgeSettings.callLogLimit(context)
             val existing = load()
             if (existing.size <= limit) return
@@ -269,7 +268,7 @@ class CallLogStore(private val context: Context) {
     }
 
     fun append(record: CallRecord) {
-        synchronized(lock) {
+        synchronized(FILE_LOCK) {
             val existing = load().toMutableList()
             existing.add(record)
             // The cap is read per append so a change takes effect immediately.
@@ -285,7 +284,8 @@ class CallLogStore(private val context: Context) {
             // total recomputed from it would shrink as they age out.
             runCatching {
                 val next = totals().plus(record)
-                totalsFile.writeText(
+                AppStorage.writeAtomically(
+                    totalsFile,
                     JSONObject().apply {
                         put("accounts", JSONObject().apply {
                             next.byAccount.forEach { (id, figures) ->
@@ -319,7 +319,7 @@ class CallLogStore(private val context: Context) {
                 },
             )
         }
-        runCatching { file.writeText(array.toString()) }
+        runCatching { AppStorage.writeAtomically(file, array.toString()) }
     }
 
     /**
@@ -329,10 +329,18 @@ class CallLogStore(private val context: Context) {
      * looking at, not the record of what the endpoint has served.
      */
     fun clear() {
-        synchronized(lock) { runCatching { file.delete() } }
+        synchronized(FILE_LOCK) { runCatching { file.delete() } }
     }
 
     private companion object {
+        /**
+         * 记录文件的进程级锁。
+         *
+         * 实例级锁挡不住 MainActivity 与 BridgeService 各持一个实例的情况，
+         * 两边会同时读改写同一个 JSON。
+         */
+        val FILE_LOCK = Any()
+
         /**
          * Used before anything has been recorded.
          *

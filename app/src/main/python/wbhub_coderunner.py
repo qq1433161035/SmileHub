@@ -40,11 +40,13 @@ def run(code, workdir="", filename="<wbhub>", argv_json="[]", sys_path_json="[]"
     __file__ 指向脚本路径，方便把工作区里的 .py 当插件反复调用。
     sys_path_json 是额外的 import 目录（工作区与私有工具目录）。
     """
+    previous_cwd = None
     if workdir:
         try:
+            previous_cwd = os.getcwd()
             os.chdir(workdir)
         except OSError:
-            pass
+            previous_cwd = None
     try:
         extra_paths = json.loads(sys_path_json) if sys_path_json else []
     except ValueError:
@@ -73,3 +75,9 @@ def run(code, workdir="", filename="<wbhub>", argv_json="[]", sys_path_json="[]"
         return buffer.getvalue()
     finally:
         sys.argv = previous_argv
+        # 工作目录是解释器全局状态：不还原会让下一次调用落在别人的目录里。
+        if previous_cwd:
+            try:
+                os.chdir(previous_cwd)
+            except OSError:
+                pass

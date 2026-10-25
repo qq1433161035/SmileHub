@@ -7,7 +7,13 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.core.content.FileProvider
+import com.wbhub.app.access.AccessibilityBridge
+import com.wbhub.app.access.ScreenCapture
+import com.wbhub.app.access.UiActions
+import com.wbhub.app.access.UiSnapshotter
 import com.wbhub.app.storage.AppStorage
 import com.wbhub.app.tooling.ToolingDb
 import com.wbhub.app.tooling.Workspace
@@ -437,6 +443,98 @@ class ToolingTools(
                 timeoutSeconds = 180,
             ),
             ::soDisassemble,
+        )
+
+        // -------------------------------------------------------------- //
+        // UI debugging through the accessibility service
+        // -------------------------------------------------------------- //
+
+        registry.register(
+            ToolSpec(
+                name = "ui_status",
+                description = "Report whether the accessibility service is enabled and connected, which " +
+                    "package is in the foreground, and whether gestures and screenshots are available. " +
+                    "Call this first when a UI task fails, so the cause is stated instead of guessed.",
+                risk = ToolRisk.READ,
+            ),
+            { uiStatus() },
+        )
+
+        registry.register(
+            ToolSpec(
+                name = "ui_dump",
+                description = "Dump the current window as a compact, indented node list. Every line starts " +
+                    "with a ref (n1, n2, ...) that ui_act accepts; refs are valid for about 10 seconds and " +
+                    "are invalidated when the screen changes, so dump again before acting. Prefer this over " +
+                    "uiautomator or screencap, which need root or ADB.",
+                risk = ToolRisk.READ,
+                properties = mapOf(
+                    "package" to stringProp("Optional package name; defaults to the active window."),
+                    "clickable" to boolProp("Only return clickable/scrollable/editable nodes. Defaults to false."),
+                    "max_nodes" to intProp("Maximum nodes to return. Defaults to 400, max 1500."),
+                    "include_text" to boolProp("Include text and content descriptions. Defaults to true."),
+                    "save" to boolProp("Write the full snapshot as JSON into the workspace. Defaults to false."),
+                ),
+                timeoutSeconds = 30,
+                maxOutputBytes = 60_000,
+            ),
+            ::uiDump,
+        )
+
+        registry.register(
+            ToolSpec(
+                name = "ui_act",
+                description = "Act on the current window: click, long_click, set_text, clear_text, scroll, " +
+                    "tap, swipe, or a global key (back/home/recents/notifications). Use a ref from the most " +
+                    "recent ui_dump; fall back to tap coordinates only when no clickable node exists.",
+                risk = ToolRisk.SENSITIVE,
+                properties = mapOf(
+                    "action" to stringProp("click | long_click | set_text | clear_text | scroll | tap | swipe | key"),
+                    "ref" to stringProp("Node ref from ui_dump, e.g. n12."),
+                    "text" to stringProp("Text for set_text."),
+                    "direction" to stringProp("forward or backward for scroll. Defaults to forward."),
+                    "steps" to intProp("Scroll steps. Defaults to 1, max 10."),
+                    "x" to mapOf("type" to "number", "description" to "X coordinate for tap."),
+                    "y" to mapOf("type" to "number", "description" to "Y coordinate for tap."),
+                    "x1" to mapOf("type" to "number", "description" to "Start X for swipe."),
+                    "y1" to mapOf("type" to "number", "description" to "Start Y for swipe."),
+                    "x2" to mapOf("type" to "number", "description" to "End X for swipe."),
+                    "y2" to mapOf("type" to "number", "description" to "End Y for swipe."),
+                    "duration_ms" to intProp("Gesture duration in milliseconds. Defaults to 300."),
+                    "key" to stringProp("back | home | recents | notifications."),
+                ),
+                required = listOf("action"),
+                timeoutSeconds = 30,
+            ),
+            ::uiAct,
+        )
+
+        registry.register(
+            ToolSpec(
+                name = "ui_wait",
+                description = "Wait until text appears, the foreground switches to a package, or the screen " +
+                    "stops changing. Use it after ui_act instead of dumping in a tight loop.",
+                risk = ToolRisk.READ,
+                properties = mapOf(
+                    "text" to stringProp("Wait until a node's text or description contains this."),
+                    "package" to stringProp("Wait until this package is in the foreground."),
+                    "idle_ms" to intProp("Wait until no content change for this many milliseconds."),
+                    "timeout_seconds" to intProp("Give up after this many seconds. Defaults to 10, max 60."),
+                ),
+                timeoutSeconds = 70,
+            ),
+            ::uiWait,
+        )
+
+        registry.register(
+            ToolSpec(
+                name = "screenshot",
+                description = "Take a screenshot through the accessibility service (Android 11+) and save it " +
+                    "in the workspace. Returns the path — call view_image on it to actually see the screen.",
+                risk = ToolRisk.READ,
+                timeoutSeconds = 30,
+            ),
+            { screenshot() },
         )
     }
 
@@ -928,7 +1026,7 @@ class ToolingTools(
             buildString {
                 appendLine("connected: ${AdbSession.connected()}")
                 appendLine("endpoint: ${endpoint ?: "-"}")
-                appendLine("keys: ${File(AppStorage.root(context), "adb").absolutePath}")
+                appendLine("keys: ${AppStorage.adb(context).absolutePath}")
                 append("提示：先在设置页「无线调试配对」输入 6 位配对码；配对后 adb_connect 会自动发现端口。")
             },
         )
@@ -1272,6 +1370,220 @@ class ToolingTools(
         }
     }
 
+    // ------------------------------------------------------------------ //
+    // UI debugging (accessibility)
+    // ------------------------------------------------------------------ //
+
+    private fun accessDisabled(tool: String) = ToolResult.fail(
+        "E_ACCESS_DISABLED",
+        "$tool 需要无障碍权限。请在「设置 → 无障碍」中开启 SmileHub 的服务；" +
+            "Android 13+ 还需在应用信息里允许「受限设置」。",
+    )
+
+    private fun uiStatus(): ToolResult {
+        val state = AccessibilityBridge.state.value
+        val text = buildString {
+            appendLine("enabled=${state.enabled}")
+            appendLine("connected=${state.connected}")
+            appendLine("package=${state.packageName ?: "-"}")
+            appendLine("sdk=${Build.VERSION.SDK_INT}")
+            appendLine("gesture=true")
+            append("screenshot=${ScreenCapture.available()}")
+        }
+        return ToolResult(
+            ok = state.connected,
+            summary = if (state.connected) "无障碍已连接" else state.message,
+            text = text,
+        )
+    }
+
+    private fun uiDump(args: Map<String, Any?>): ToolResult {
+        val service = AccessibilityBridge.service() ?: return accessDisabled("ui_dump")
+        val filters = UiSnapshotter.Filters(
+            packageName = args.str("package"),
+            clickableOnly = args.bool("clickable") == true,
+            maxNodes = (args.int("max_nodes") ?: 400).coerceIn(1, 1_500),
+        )
+        val snapshot = AccessibilityBridge.withLock { UiSnapshotter.capture(service, filters) }
+            ?: return ToolResult.fail("E_NO_WINDOW", "当前没有可读窗口：锁屏或界面正在切换，稍后再试")
+        AccessibilityBridge.withLock { AccessibilityBridge.remember(snapshot) }
+
+        val body = snapshot.render(args.bool("include_text") != false)
+        if (args.bool("save") != true) {
+            return ToolResult(true, "界面快照 ${snapshot.nodes.size} 个节点", body)
+        }
+        val dir = File(workspace.root, "ui").apply { mkdirs() }
+        val file = File(dir, "ui-${System.currentTimeMillis()}.json")
+        runCatching { file.writeText(snapshot.toJson()) }.getOrElse {
+            return ToolResult.error("E_IO", "快照落盘失败：${it.message}")
+        }
+        return ToolResult(
+            ok = true,
+            summary = "界面快照 ${snapshot.nodes.size} 个节点",
+            text = "$body\n完整快照：${file.absolutePath}",
+        )
+    }
+
+    private fun uiAct(args: Map<String, Any?>): ToolResult {
+        val service = AccessibilityBridge.service() ?: return accessDisabled("ui_act")
+        val action = args.str("action") ?: return ToolResult.fail("E_INPUT", "action is required")
+        val needsNode = action in NODE_ACTIONS
+
+        // 遍历、取 ref、执行动作必须串行：NodeSnapshot 可能被另一个会话替换/回收。
+        return AccessibilityBridge.withLock {
+        val node: AccessibilityNodeInfo? = if (needsNode) {
+            AccessibilityBridge.node(args.str("ref"))
+                ?: return@withLock ToolResult.fail(
+                    "E_STALE_REF",
+                    "ref 已失效或未提供：界面可能已变化，请重新调用 ui_dump 再操作",
+                )
+        } else {
+            null
+        }
+
+        when (action) {
+            "click" -> {
+                if (UiActions.click(node)) ToolResult(true, "已点击", "")
+                else ToolResult.fail("E_NOT_CLICKABLE", "该节点及其祖先都不可点击；可换节点或用 tap 坐标")
+            }
+
+            "long_click" -> {
+                if (UiActions.longClick(node)) ToolResult(true, "已长按", "")
+                else ToolResult.fail("E_NOT_CLICKABLE", "该节点及其祖先都不支持长按")
+            }
+
+            "set_text", "clear_text" -> {
+                val text = if (action == "clear_text") {
+                    ""
+                } else {
+                    (args["text"] as? String) ?: return@withLock ToolResult.fail("E_INPUT", "set_text 需要 text")
+                }
+                if (UiActions.setText(node, text)) {
+                    ToolResult(true, if (text.isEmpty()) "已清空" else "已写入 ${text.take(20)}", "")
+                } else {
+                    ToolResult.fail("E_NOT_EDITABLE", "目标不是输入框：找 editable 节点，或先点击让它获得焦点")
+                }
+            }
+
+            "scroll" -> {
+                val forward = args.str("direction")?.lowercase() != "backward"
+                val steps = (args.int("steps") ?: 1).coerceIn(1, 10)
+                var done = 0
+                repeat(steps) { if (UiActions.scroll(node, forward)) done++ }
+                if (done == 0) {
+                    ToolResult.fail("E_NOT_SCROLLABLE", "该节点及其祖先都不可滚动；可改用 swipe 手势")
+                } else {
+                    ToolResult(true, "已滚动 $done 次", "")
+                }
+            }
+
+            "tap" -> {
+                val x = args.float("x") ?: return@withLock ToolResult.fail("E_INPUT", "tap 需要 x 与 y")
+                val y = args.float("y") ?: return@withLock ToolResult.fail("E_INPUT", "tap 需要 x 与 y")
+                if (UiActions.tap(service, x, y)) ToolResult(true, "已点击 (${x.toInt()}, ${y.toInt()})", "")
+                else ToolResult.fail("E_GESTURE", "系统拒绝了该手势")
+            }
+
+            "swipe" -> {
+                val x1 = args.float("x1") ?: return@withLock ToolResult.fail("E_INPUT", "swipe 需要 x1/y1/x2/y2")
+                val y1 = args.float("y1") ?: return@withLock ToolResult.fail("E_INPUT", "swipe 需要 x1/y1/x2/y2")
+                val x2 = args.float("x2") ?: return@withLock ToolResult.fail("E_INPUT", "swipe 需要 x1/y1/x2/y2")
+                val y2 = args.float("y2") ?: return@withLock ToolResult.fail("E_INPUT", "swipe 需要 x1/y1/x2/y2")
+                val duration = (args.int("duration_ms") ?: 300).toLong()
+                if (UiActions.swipe(service, x1, y1, x2, y2, duration)) {
+                    ToolResult(true, "已滑动", "")
+                } else {
+                    ToolResult.fail("E_GESTURE", "系统拒绝了该手势")
+                }
+            }
+
+            "key" -> {
+                val key = args.str("key") ?: return@withLock ToolResult.fail("E_INPUT", "key 需要 back/home/recents/notifications")
+                if (UiActions.global(service, key)) ToolResult(true, "已执行 $key", "")
+                else ToolResult.fail("E_INPUT", "不支持或系统拒绝：$key")
+            }
+
+            else -> ToolResult.fail("E_INPUT", "unknown action: $action")
+        }
+        }
+    }
+
+    private fun uiWait(args: Map<String, Any?>): ToolResult {
+        val service = AccessibilityBridge.service() ?: return accessDisabled("ui_wait")
+        val text = args.str("text")
+        val pkg = args.str("package")
+        val idleMs = args.int("idle_ms") ?: 0
+        if (text == null && pkg == null && idleMs <= 0) {
+            return ToolResult.fail("E_INPUT", "text / package / idle_ms 至少提供一个")
+        }
+        val timeoutSeconds = (args.int("timeout_seconds") ?: 10).coerceIn(1, 60)
+        val deadline = SystemClock.uptimeMillis() + timeoutSeconds * 1_000L
+
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (text != null) {
+                val snapshot = AccessibilityBridge.withLock {
+                    UiSnapshotter.capture(service, UiSnapshotter.Filters(maxNodes = 1_500))
+                }
+                if (snapshot != null) {
+                    val hit = snapshot.nodes.firstOrNull {
+                        it.text?.contains(text) == true || it.desc?.contains(text) == true
+                    }
+                    if (hit != null) {
+                        AccessibilityBridge.withLock { AccessibilityBridge.remember(snapshot) }
+                        return ToolResult(
+                            ok = true,
+                            summary = "已等到「$text」",
+                            text = "${hit.ref}  ${hit.className}  ${hit.text ?: hit.desc.orEmpty()}  ${hit.bounds}",
+                        )
+                    }
+                    // 轮询用的临时快照不留在缓存里，句柄要当场释放。
+                    AccessibilityBridge.withLock { snapshot.release() }
+                }
+            }
+            if (pkg != null && AccessibilityBridge.state.value.packageName == pkg) {
+                return ToolResult(true, "已切换到 $pkg", "")
+            }
+            if (idleMs > 0 && SystemClock.uptimeMillis() - AccessibilityBridge.lastChangeAt() >= idleMs) {
+                return ToolResult(true, "界面已静止 ${idleMs}ms", "")
+            }
+            try {
+                Thread.sleep(150)
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return ToolResult.fail("E_CANCELLED", "ui_wait 已停止")
+            }
+        }
+        return ToolResult.fail("E_TIMEOUT", "等待超时（${timeoutSeconds}s）")
+    }
+
+    private fun screenshot(): ToolResult {
+        val service = AccessibilityBridge.service() ?: return accessDisabled("screenshot")
+        if (!ScreenCapture.available()) {
+            return ToolResult.fail("E_UNSUPPORTED", "系统低于 Android 11：请改用 adb_shell screencap 或 root")
+        }
+        val dir = File(workspace.root, "ui").apply { mkdirs() }
+        val result = ScreenCapture.capture(service, dir)
+        val file = result.file
+        if (!result.ok || file == null) {
+            val code = when (result.code) {
+                "UNSUPPORTED" -> "E_UNSUPPORTED"
+                "SECURE" -> "E_SECURE_WINDOW"
+                "TIMEOUT" -> "E_TIMEOUT"
+                "IO" -> "E_IO"
+                "INTERVAL" -> "E_INTERVAL"
+                "NO_ACCESS" -> "E_ACCESS_LOST"
+                "INVALID_DISPLAY" -> "E_DISPLAY"
+                else -> "E_SCREENSHOT"
+            }
+            return ToolResult.fail(code, result.message)
+        }
+        return ToolResult(
+            ok = true,
+            summary = result.message,
+            text = "路径：${file.absolutePath}\n用 view_image 查看该文件。",
+        )
+    }
+
     private fun parseAddress(text: String): Long? {
         val value = text.trim()
         return if (value.startsWith("0x", ignoreCase = true)) {
@@ -1320,6 +1632,9 @@ class ToolingTools(
         const val ADB_PREFS = "adb"
         val PACKAGE_NAME = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+")
         val PERMISSION_NAME = Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+")
+
+        /** 这些动作必须带一个来自 ui_dump 的 ref。 */
+        val NODE_ACTIONS = setOf("click", "long_click", "set_text", "clear_text", "scroll")
     }
 }
 
@@ -1340,5 +1655,11 @@ internal fun Map<String, Any?>.int(key: String): Int? = when (val value = this[k
 internal fun Map<String, Any?>.bool(key: String): Boolean? = when (val value = this[key]) {
     is Boolean -> value
     is String -> value.toBooleanStrictOrNull()
+    else -> null
+}
+
+internal fun Map<String, Any?>.float(key: String): Float? = when (val value = this[key]) {
+    is Number -> value.toFloat()
+    is String -> value.toFloatOrNull()
     else -> null
 }

@@ -2,52 +2,46 @@
 
 [English](./README.en.md) | 中文
 
-> 作者：微笑（weixiao）
-
-把 WorkBuddy 账号接到任意 OpenAI 兼容客户端。App 在手机本地起一个转发端点，你的
-编辑器 / Agent / 脚本把 `baseUrl` 指过来就能用，不需要官方开放 API，也不需要电
-脑。
+把 WorkBuddy 账号接入任意 OpenAI 兼容客户端。App 在手机本地启动一个转发端点，
+编辑器、Agent 或脚本把 `baseUrl` 指过来即可使用，不需要官方开放 API，也不需要电脑。
 
 ```
 手机
 ├─ SmileHub
 │    ├─ OAuth 登录（国内版 / 国际版）
 │    ├─ 本地转发端点  127.0.0.1:8765
-│    └─ 悬浮窗状态面板（防止后台被系统冻结）
+│    └─ 悬浮窗状态面板（避免后台被系统冻结）
 │
 └─ 任意 OpenAI 兼容客户端
      └─ baseUrl = http://127.0.0.1:8765/v1
 ```
 
-## 演示
-
-B 站演示视频：[对开源项目的二次封装](https://www.bilibili.com/video/BV1tKnp6FE7n)
-
 ## 功能
 
-- **账号接入**：走官方 CLI 的 OAuth 流程取凭证，登录一次即可长期使用，Token 过期
-  自动刷新
-- **双版本并存**：国内版与国际版是两套独立账号体系，可以各登录一个并随时切换，
-  切换即时生效，无需重新登录
-- **本地转发端点**：OpenAI 兼容（`/v1/models`、`/v1/chat/completions`），流式输出
-  原样透传
-- **悬浮窗保活**：显示一个小状态面板，让应用保持可见，避免服务在后台被系统冻结。
-  面板可拖动、可收起，支持调节透明度与固定位置
-- **调用记录**：记录每次调用的模型、Tokens 与积分消耗，并汇总统计
-- **签到与余额**：查看剩余积分、执行每日签到
-- **内置 Agent**：对话页可读写文件、执行 shell/Python、调用逆向与设备工具，
-  多会话可并行，长任务有上下文压缩与断流续写
-- **多模态**：相册选图或直接给图片路径，模型都能真正“看到”图
-- **自扩展工具箱**：内置工具不够用时，Agent 可自行下载可执行文件、Python 包或
-  脚本，落到指定目录后直接调用，无需等待版本更新
+- **账号接入**：走官方 CLI 的 OAuth 流程获取凭证，登录一次长期可用，Token 过期自动刷新。
+- **双版本并存**：国内版与国际版是两套独立账号体系，可各登录一个并随时切换，切换即时生效。
+- **本地转发端点**：兼容 OpenAI（`/v1/models`、`/v1/chat/completions`），同时支持
+  Anthropic Messages 与 OpenAI Responses 格式，SSE 流式原样透传。
+- **悬浮窗保活**：显示可拖动、可收起的轻量状态面板，让应用保持可见，避免服务在后台被冻结。
+- **调用记录**：记录每次调用的模型、Tokens 与积分消耗，并按账号汇总。
+- **签到与余额**：查看剩余积分、执行每日签到。
+- **内置 Agent**：对话页可读写文件、执行 shell / Python、调用逆向与设备工具；
+  支持多会话并发、上下文压缩、断流续写、跨会话长期记忆与子代理并行。
+- **多模态**：相册选图或直接提供图片路径，模型可以真正读到图片内容。
+- **自扩展工具箱**：内置工具不足时，Agent 可自行下载可执行文件、Python 包或脚本，
+  放入指定目录后直接调用，无需等待版本更新。
+- **逆向工具链**：APK 解码 / 回打包、DEX 反编译、SO 解析与反汇编、签名、对齐。
+- **设备能力**：无线 ADB 配对与 shell、无障碍界面调试、截图与界面操作。
 
-以上只是概览。多模态、多会话并发、内置 Agent 工具链、自扩展机制、逆向/ADB/Python
-运行时等完整能力清单见 [docs/FEATURES.md](./docs/FEATURES.md)。
+## 环境要求
+
+| 项 | 要求 |
+| --- | --- |
+| 运行 | Android 8.0（API 26）及以上，arm64-v8a |
+| 构建 | JDK 21、Android SDK platform 35 与 build-tools |
+| Gradle | 使用仓库自带 wrapper，无需单独安装 |
 
 ## 构建
-
-需要 JDK 21 与 Android SDK（含 platform 35 与 build-tools）。Gradle 由项目自带
-的 wrapper 提供，无需单独安装。
 
 ### Linux / macOS
 
@@ -65,11 +59,18 @@ echo "sdk.dir=$HOME/Android/Sdk" > local.properties
 .\gradlew.bat assembleDebug
 ```
 
-`local.properties` 里的 SDK 路径按你的实际安装位置调整。
+`local.properties` 里的 SDK 路径按实际安装位置调整。
 
-产物在 `app/build/outputs/apk/debug/app-debug.apk`。
+- 调试包：`app/build/outputs/apk/debug/app-debug.apk`
+- 单元测试：`./gradlew test`
+- 正式包：`./gradlew assembleRelease`
 
-### 安装到设备
+正式包默认开启 R8 混淆与资源压缩。签名信息从 `keystore.properties` 读取
+（`storeFile`、`storePassword`、`keyAlias`、`keyPassword`）；该文件已被 git 忽略。
+没有签名材料时产物为 `app-release-unsigned.apk`，可用 debug keystore 临时签名做真机
+冒烟，但不要作为正式分发包。
+
+## 安装
 
 ```sh
 adb install -r app/build/outputs/apk/debug/app-debug.apk
@@ -77,10 +78,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 使用
 
-1. **登录**：打开 App → 「凭证」→ 选择版本 → 点登录 → 在浏览器完成登录
-2. **启动服务**：「API 平台」→ 打开开关
-3. **开启悬浮窗**：点「开启悬浮窗」并授权。这一步是为了让服务在后台保持运行
-4. **接入客户端**：「API 平台」页显示 baseUrl 与 apiKey，填进你的客户端
+1. **登录**：打开 App →「个人信息」→ 选择版本 → 点登录，在浏览器完成授权。
+2. **启动服务**：「API」→ 打开开关。
+3. **开启悬浮窗**：点「开启悬浮窗」并授权，让服务在后台保持运行。
+4. **接入客户端**：「API」页会显示 `baseUrl` 与 `apiKey`，填入你的客户端。
 
 ### 客户端配置
 
@@ -101,38 +102,37 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 }
 ```
 
-模型名见 App「API 平台」页的列表（点模型名可复制）。
+模型名以 App「API」页的列表为准，点模型名可复制。首次运行会随机生成本机密钥，
+设置页可查看、复制或修改。
 
 ## 为什么需要悬浮窗
 
-Android 会在应用进入后台后冻结进程，被冻结的进程不再处理网络请求，表现就是客户
-端调用超时。前台服务并不足以避免这一点——本项目的实测结果是被冻结后仍然超时。
-
-悬浮窗让应用保持"可见"状态，进程重要性因此提升，不再被冻结。这不需要 root，也不
-需要额外工具，在系统设置里授权一次即可。
+Android 会在应用进入后台后冻结进程，被冻结的进程不再处理网络请求，表现就是客户端
+调用超时。前台服务并不足以避免这一点；悬浮窗让应用保持“可见”状态，进程重要性因此
+提升，不再被冻结。该方案不需要 root，在系统设置里授权一次即可。
 
 ## 工作原理
 
 ```
 客户端请求
-  │  OpenAI 协议
+  │  OpenAI / Anthropic / Responses 协议
   ▼
 本地转发端点（127.0.0.1:8765）
   │  ① 改写请求体（上游要求 stream、拒绝 developer 角色）
   │  ② 补上 WorkBuddy 专有的身份头
   │  ③ 带上你的 access token
   ▼
-WorkBuddy 上游（copilot.tencent.com / www.workbuddy.ai）
+WorkBuddy 上游
   │  返回 SSE 流
   ▼
 原样透传给客户端
 ```
 
-转发端点只监听 `127.0.0.1`，且每个请求都要带共享密钥，因此同设备上的其它应用无
-法直接调用它。
+端点默认只监听 `127.0.0.1`，每个请求都要带共享密钥，同设备的其它应用无法直接调用。
+可在设置中开启局域网访问，并使用独立的局域网密钥鉴权；也可在 `端口 + 1` 提供 HTTPS。
 
-上游接口是 WorkBuddy 客户端使用的私有接口，不是官方开放 API。上游改动可能导致功
-能失效，届时需要跟随调整。
+上游接口是 WorkBuddy 客户端使用的私有接口，不是官方开放 API。上游改动可能导致功能
+失效，届时需要跟随调整。
 
 ## 技术栈与依赖
 
@@ -185,35 +185,39 @@ minSdk 26 · targetSdk 28 · 仅打包 arm64-v8a。
 
 以上库的版权与许可证归各自作者所有，使用与分发时请遵守对应项目的许可条款。
 
+## 隐私
+
+- 账号凭据、会话、记忆与设置只存在本机，不上传、不参与云端同步。
+- 凭据、ADB 私钥、TLS CA 私钥与签名密钥存放在应用私有目录，不使用共享存储。
+- 会话与调用记录默认保存在本机，用户可自行查看、备份或删除。
+
+## 已知限制
+
+- 依赖 WorkBuddy 私有接口，上游更新后可能需要适配。
+- 悬浮窗保活取决于系统重要性判定，激进的后台管理策略下仍可能被限制。
+- 内置工具链与 Python 运行时只打包 arm64-v8a。
+- `targetSdk 28` 用于允许执行下载到私有目录的 ELF；代价是新系统的部分存储、
+  通知与前台服务限制不生效。
+- 仅在 Android 上验证。
+
+## 免责声明
+
+- 本项目仅供个人学习与研究使用，仅驱动使用者自己的账号在本机调用。
+- 使用者需遵守 WorkBuddy 的服务条款；因使用本项目产生的任何后果由使用者自行承担。
+- 本项目与腾讯、WorkBuddy 无关联，未获其授权或认可；相关名称仅用于描述兼容关系。
+
+## 贡献与反馈
+
+- 本项目开源后不再修复任何 Bug，也不接受功能请求。
+- Issue 与 PR 仅作留档，不保证回复或合并。
+- 作者：微笑（weixiao）· QQ：791940981
+
 ## 参考项目
 
 - [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)
 - [xc3qaq/WorkBuddy-Hub-Android](https://github.com/xc3qaq/WorkBuddy-Hub-Android)
 
 感谢以上项目在协议适配与实现思路上的参考。
-
-## 作者
-
-- 微笑（weixiao）
-- QQ：791940981
-
-## 已知限制
-
-- 悬浮窗保活依赖系统的重要性判定，在激进的后台管理策略下仍可能被限制
-- 国际版账号可能需要先在官方客户端完成试用激活，否则上游会拒绝计费类请求
-- 依赖 WorkBuddy 私有接口，上游更新后可能需要适配
-- 仅在 Android 上验证
-
-## 免责声明
-
-- 本项目仅供个人学习与研究使用，仅驱动使用者自己的账号在本机调用
-- 使用者需遵守 WorkBuddy 的服务条款；因使用本项目产生的任何后果由使用者自行承担
-- 本项目与腾讯、WorkBuddy 无关联，未获其授权或认可；相关名称仅用于描述兼容关系
-
-## 维护
-
-构建、发版、目录结构、排障对照和已知技术债见
-[docs/MAINTENANCE.md](./docs/MAINTENANCE.md)。
 
 ## 许可
 

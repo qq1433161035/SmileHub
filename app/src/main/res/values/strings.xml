@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">SmileHub</string>
+    <string name="accessibility_service_label">SmileHub 界面调试</string>
+    <string name="accessibility_service_description">
+        供 AI 读取当前界面结构、点击控件、输入文字与截图，仅在你于对话中发起调试任务时使用。
+    </string>
 </resources>

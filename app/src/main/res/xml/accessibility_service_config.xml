@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  给 AI 用的界面调试服务。
+
+  - canRetrieveWindowContent：读取节点树
+  - canPerformGestures：点击 / 滑动（API 24+，本项目 minSdk 26）
+  - canTakeScreenshot：API 30+ 才有效，低版本系统忽略
+  - flagIncludeNotImportantViews：树更全，输出层负责裁剪
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

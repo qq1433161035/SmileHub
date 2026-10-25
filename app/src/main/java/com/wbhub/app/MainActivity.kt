@@ -24,15 +24,30 @@ import com.wbhub.app.bridge.CallLogStore
 import com.wbhub.app.bridge.CallRecord
 import com.wbhub.app.bridge.Notifications
 import com.wbhub.app.data.CheckinItem
+import com.wbhub.app.data.AppNotice
+import com.wbhub.app.data.AppNoticeClient
 import com.wbhub.app.data.Login
 import com.wbhub.app.proto.AutoTaskRunner
 import com.wbhub.app.agent.AgentClient
+import com.wbhub.app.agent.AgentRunService
 import com.wbhub.app.agent.AgentStore
 import com.wbhub.app.agent.AgentTools
 import com.wbhub.app.agent.ApprovalMode
 import com.wbhub.app.agent.ArtifactStore
 import com.wbhub.app.agent.CompactionState
+import com.wbhub.app.agent.ContextBudget
 import com.wbhub.app.agent.ContextEngine
+import com.wbhub.app.agent.SUBAGENT_RULES
+import com.wbhub.app.agent.SubagentLimits
+import com.wbhub.app.agent.SubagentReport
+import com.wbhub.app.agent.SubagentRunner
+import com.wbhub.app.agent.SubagentTask
+import com.wbhub.app.agent.SystemPrompts
+import com.wbhub.app.agent.memory.MemoryIndexer
+import com.wbhub.app.agent.memory.MemorySearch
+import com.wbhub.app.agent.memory.MemoryStats
+import com.wbhub.app.agent.memory.MemoryStore
+import com.wbhub.app.agent.memory.MemoryTools
 import com.wbhub.app.proto.CheckinOutcome
 import com.wbhub.app.proto.Credential
 import com.wbhub.app.proto.CredentialStore
@@ -41,6 +56,7 @@ import com.wbhub.app.proto.Wire
 import com.wbhub.app.proto.toHubModel
 import com.wbhub.app.storage.AppStorage
 import com.wbhub.app.tools.ToolingRuntime
+import com.wbhub.app.tools.worker.ToolWorkerClient
 import com.wbhub.app.ui.ToolingArtifact
 import com.wbhub.app.ui.ToolingOperation
 import com.wbhub.app.ui.ToolingProject
@@ -49,6 +65,7 @@ import com.wbhub.app.ui.AgentEntry
 import com.wbhub.app.ui.AgentState
 import com.wbhub.app.ui.CheckinDialog
 import com.wbhub.app.ui.EFFORT_OFF
+import com.wbhub.app.ui.AppNoticeDialog
 import com.wbhub.app.ui.HubApp
 import com.wbhub.app.ui.Loading
 import com.wbhub.app.ui.LogoutDialog
@@ -58,11 +75,18 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -79,6 +103,8 @@ class MainActivity : ComponentActivity() {
 
     private var state by mutableStateOf(HubState())
     private var showHelp by mutableStateOf(false)
+    /** 启动时拉到的远程公告；为 null 时不显示。 */
+    private var appNotice by mutableStateOf<AppNotice?>(null)
 
     /** The agent page keeps its own transcript and settings. */
     private var agent by mutableStateOf(AgentState())
@@ -95,6 +121,32 @@ class MainActivity : ComponentActivity() {
 
     /** Settings and saved conversations for the agent page. */
     private lateinit var agentStore: AgentStore
+
+    /** 长期记忆：只在真正需要时打开，默认关闭时不产生任何文件。 */
+    private val memoryStore: MemoryStore by lazy { MemoryStore.get(this) }
+    private val memoryIndexer: MemoryIndexer by lazy {
+        MemoryIndexer(memoryStore) { agentStore.memoryEnabled() }
+    }
+
+    /** 所有会话共享的子代理并发额度；设置变更后在下一次子代理调用生效。 */
+    @Volatile
+    private var subagentSlots = Semaphore(SubagentLimits.DEFAULT_CONCURRENT)
+
+    @Volatile
+    private var subagentSlotsPermits = SubagentLimits.DEFAULT_CONCURRENT
+
+    /** 按当前设置返回共享 semaphore；改并发数时换一个新的，已在跑的任务仍用旧的。 */
+    private fun subagentSemaphore(limit: Int): Semaphore {
+        val normalized = limit.coerceIn(SubagentLimits.MIN_CONCURRENT, SubagentLimits.MAX_CONCURRENT)
+        if (normalized == subagentSlotsPermits) return subagentSlots
+        synchronized(this) {
+            if (normalized != subagentSlotsPermits) {
+                subagentSlotsPermits = normalized
+                subagentSlots = Semaphore(normalized)
+            }
+            return subagentSlots
+        }
+    }
 
     /**
      * The exchange so far, kept in the shape the model needs. The visible
@@ -121,13 +173,27 @@ class MainActivity : ComponentActivity() {
         var compaction = CompactionState()
         var entries: List<AgentEntry> = emptyList()
         var pendingApproval: String? = null
+        /** 后台会话沿用发送时的审批模式；前台会话实时读设置。 */
+        var approval: ApprovalMode = ApprovalMode.AUTO
         val answers = LinkedBlockingQueue<Boolean>()
+
+        /** 会话已被用户删除：排队中的事件不得再把它写回磁盘。 */
+        @Volatile
+        var deleted = false
     }
 
     private val agentRuns = mutableMapOf<String, AgentRun>()
 
     /** Delivers streamed agent events to the main thread. */
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * 会话写盘单独串行：长会话的 JSON 序列化与重扫会话目录不再卡主线程。
+     * 单线程保证同一个会话的多次保存按顺序落盘。
+     */
+    private val sessionWriter = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "wbhub-session-write").apply { isDaemon = true }
+    }
 
     /**
      * Sign-in polling must survive the app leaving the foreground, because the
@@ -164,15 +230,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        AppStorage.init(this)
         store = CredentialStore(this)
         callLog = CallLogStore(this)
         agentStore = AgentStore(this)
         Notifications.ensureChannel(this)
         refreshCredential()
-        // Keep the daemon's credential copy current, including the first run
-        // after an account switch happened while it was not running.
-        store.mirrorActiveForDaemon()
         loadBalance()
         loadModels()
         // 调用记录不在启动时读取：条目可能很多，用户进「个人信息」后按需加载。
@@ -180,6 +242,8 @@ class MainActivity : ComponentActivity() {
         // prompt, so editing a script does not require opening the 工程 page.
         lifecycleScope.launch(Dispatchers.IO) {
             runCatching { ToolingRuntime.get(this@MainActivity) }
+            // 工具执行进程提前拉起：第一次调用不必再等进程冷启动。
+            runCatching { ToolWorkerClient.get(this@MainActivity).warmUp() }
         }
         state = state.copy(
             notificationsAllowed = Notifications.hasPermission(this),
@@ -213,19 +277,31 @@ class MainActivity : ComponentActivity() {
         val restored = activeId.takeIf { it.isNotEmpty() }?.let { agentStore.load(it) }
         lastAgentTranscript = restored?.messages ?: emptyList()
         lastCompaction = restored?.compaction ?: CompactionState()
+        val storedWorkDir = agentStore.workDir()
+        val safeWorkDir = AgentTools.sanitizeWorkDir(this, storedWorkDir.ifEmpty { agent.workDir })
+        if (safeWorkDir.absolutePath != storedWorkDir) {
+            agentStore.setWorkDir(safeWorkDir.absolutePath)
+        }
         agent = agent.copy(
             storageGranted = hasAllFilesAccess(),
             modelId = agentStore.modelId(),
             effort = agentStore.effort(),
             contextWindow = agentStore.contextWindow(),
             exposeRoot = agentStore.exposeRoot(),
-            workDir = agentStore.workDir().ifEmpty { agent.workDir },
+            workDir = safeWorkDir.absolutePath,
             approval = agentStore.approval(),
             maxRounds = agentStore.maxRounds(),
             compactionEnabled = agentStore.compactionEnabled(),
             compactTrigger = agentStore.compactTrigger(),
             compactKeepTurns = agentStore.compactKeepTurns(),
             offloadChars = agentStore.offloadChars(),
+            systemPrompt = agentStore.systemPrompt(),
+            systemPromptEnabled = agentStore.systemPromptEnabled(),
+            systemBaseline = agentStore.systemBaseline(),
+            subagentConcurrency = agentStore.subagentConcurrency(),
+            memoryEnabled = agentStore.memoryEnabled(),
+            memoryTopK = agentStore.memoryTopK(),
+            memoryMinScore = agentStore.memoryMinScore(),
             sessions = agentStore.sessions(),
             sessionId = restored?.id.orEmpty(),
             sessionTitle = restored?.title.orEmpty(),
@@ -238,6 +314,7 @@ class MainActivity : ComponentActivity() {
         // Root is probed rather than assumed: the switch is meaningless on a
         // device that never grants it.
         checkRootAvailability()
+        if (agentStore.memoryEnabled()) refreshMemoryStats()
         // The endpoint is off by default: it exists for other devices to call,
         // and starting it behind the user's back also forces a floating panel.
 
@@ -254,6 +331,12 @@ class MainActivity : ComponentActivity() {
                 onStopBridge = { stopBridge() },
                 onLogin = { region -> startLogin(region) },
                 onLogout = { state = state.copy(showLogoutConfirm = true) },
+                onConfirmLogout = {
+                    state = state.copy(showLogoutConfirm = false)
+                    clearAgent()
+                    logout()
+                },
+                onDismissLogout = { state = state.copy(showLogoutConfirm = false) },
                 onClearCalls = { clearCalls() },
                 onOpenCallSettings = {
                     // 设置页要显示占用大小，打开时按需读一次。
@@ -268,14 +351,23 @@ class MainActivity : ComponentActivity() {
                 onDismissCallSettings = { state = state.copy(showCallSettings = false) },
                 onCallLimitChange = { limit ->
                     BridgeSettings.setCallLogLimit(this, limit)
-                    // Trimming now rather than at the next call, so the size
-                    // shown reflects the limit that was just chosen.
-                    callLog.trimToLimit()
-                    state = state.copy(
-                        callLogLimit = BridgeSettings.callLogLimit(this),
-                        calls = callLog.load(),
-                        callLogBytes = callLog.estimatedBytes(BridgeSettings.callLogLimit(this)),
-                    )
+                    state = state.copy(callLogLimit = limit)
+                    // 裁剪与重读都放到 IO：10 万条记录时在主线程做会 ANR。
+                    lifecycleScope.launch {
+                        withContext(Dispatchers.IO) {
+                            callLog.trimToLimit()
+                            val current = BridgeSettings.callLogLimit(this@MainActivity)
+                            val calls = callLog.load()
+                            val bytes = callLog.estimatedBytes(current)
+                            withContext(Dispatchers.Main.immediate) {
+                                state = state.copy(
+                                    callLogLimit = current,
+                                    calls = calls,
+                                    callLogBytes = bytes,
+                                )
+                            }
+                        }
+                    }
                 },
                 onRefreshCalls = { loadCalls() },
                 onOverlayOpacity = { value ->
@@ -459,7 +551,40 @@ class MainActivity : ComponentActivity() {
                     agentStore.setOffloadChars(chars)
                     agent = agent.copy(offloadChars = chars)
                 },
+                onAgentToggleSystemPrompt = { enabled ->
+                    agentStore.setSystemPromptEnabled(enabled)
+                    agent = agent.copy(systemPromptEnabled = enabled)
+                },
+                onAgentSaveSystemPrompt = { text ->
+                    val clipped = text.take(SystemPrompts.MAX_USER_CHARS)
+                    agentStore.setSystemPrompt(clipped)
+                    agent = agent.copy(systemPrompt = clipped)
+                },
+                onAgentSaveSystemBaseline = { text ->
+                    agentStore.setSystemBaseline(text)
+                    agent = agent.copy(systemBaseline = agentStore.systemBaseline())
+                },
+                onAgentSelectSubagentConcurrency = { value ->
+                    agentStore.setSubagentConcurrency(value)
+                    agent = agent.copy(subagentConcurrency = agentStore.subagentConcurrency())
+                },
                 onAgentCompactNow = { compactAgentNow() },
+                onAgentToggleMemory = { enabled ->
+                    agentStore.setMemoryEnabled(enabled)
+                    agent = agent.copy(memoryEnabled = enabled)
+                    if (enabled) refreshMemoryStats()
+                },
+                onAgentSelectMemoryTopK = { value ->
+                    agentStore.setMemoryTopK(value)
+                    agent = agent.copy(memoryTopK = value)
+                },
+                onAgentSelectMemoryMinScore = { value ->
+                    agentStore.setMemoryMinScore(value)
+                    agent = agent.copy(memoryMinScore = value)
+                },
+                onAgentRebuildMemory = { rebuildMemory() },
+                onAgentClearMemory = { clearMemory() },
+                onAgentRefreshMemory = { refreshMemoryStats() },
                 onAgentAnswerApproval = { allow -> answerApproval(allow) },
                 onAgentStop = { stopAgent() },
                 onAgentRequestStorage = { requestAllFilesAccess() },
@@ -484,14 +609,33 @@ class MainActivity : ComponentActivity() {
                 onTabShown = { tab ->
                     // 余额随账号变化，进页面时拉一次；调用记录改成手动加载。
                     if (tab == HubTab.Personal) loadBalance()
+                    // 记忆统计可能在工具写入/自动索引后变化，进设置页时刷新一次。
+                    if (tab == HubTab.Settings) refreshMemoryStats()
                 },
             )
+
+            appNotice?.let { notice ->
+                AppNoticeDialog(
+                    notice = notice,
+                    onDismiss = { appNotice = null },
+                    onDontShow = {
+                        AppNoticeClient.dismiss(this@MainActivity, notice)
+                        appNotice = null
+                    },
+                )
+            }
         }
 
         requestNotificationPermissionIfNeeded()
         // The agent's shell works on real files, so the storage switch is asked
         // for up front rather than only when the agent page is first opened.
         if (!hasAllFilesAccess()) mainHandler.postDelayed({ requestAllFilesAccess() }, 800)
+        // 与 ATool 一样延迟 2 秒，避免和启动动画/首屏加载抢资源。
+        lifecycleScope.launch {
+            delay(2_000)
+            val notice = withContext(Dispatchers.IO) { AppNoticeClient.check(this@MainActivity) }
+            if (notice != null) appNotice = notice
+        }
     }
 
     /**
@@ -504,6 +648,8 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         persistAgentSession()
+        // 写盘已移到后台线程，退出前等它排空，避免刚切走就被杀导致丢会话。
+        flushSessions()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -633,26 +779,38 @@ class MainActivity : ComponentActivity() {
      * flash that short reads as "nothing happened".
      */
     private suspend fun <T> withLoading(kind: Loading, block: suspend () -> T): T {
-        state = state.copy(loading = kind)
+        // 调用方在 Dispatchers.IO 里：状态写必须回到主线程，否则会和主线程的
+        // copy-modify-write 竞争，丢掉别的字段更新。
+        withContext(Dispatchers.Main.immediate) { state = state.copy(loading = kind) }
         val started = System.currentTimeMillis()
         return try {
             block()
         } finally {
             val elapsed = System.currentTimeMillis() - started
             if (elapsed < MIN_LOADING_MS) delay(MIN_LOADING_MS - elapsed)
-            state = state.copy(loading = null)
+            withContext(Dispatchers.Main.immediate) { state = state.copy(loading = null) }
         }
     }
 
     private fun loadModels() {
         val cred = state.credential ?: return
         lifecycleScope.launch {
-            val models = withContext(Dispatchers.IO) {
+            val fetched = withContext(Dispatchers.IO) {
                 withLoading(Loading.MODELS) {
-                    runCatching { upstream.fetchModels(cred).map { it.toHubModel() } }.getOrDefault(emptyList())
+                    runCatching { upstream.fetchModels(cred).map { it.toHubModel() } }
                 }
             }
+            val models = fetched.getOrNull()
+            if (models == null) {
+                // 失败不是“没有模型”：保留已保存的列表与当前选择，否则一次断网
+                // 就会把 model/effort/context 全部清掉。
+                if (state.models.isEmpty()) state = state.copy(status = "模型列表加载失败")
+                else toast("模型列表加载失败，保留当前列表")
+                return@launch
+            }
             state = state.copy(models = models)
+            // 上游确实返回空列表时也不动当前选择：用户可能只是暂时没有可用模型。
+            if (models.isEmpty()) return@launch
             // The agent needs a model chosen before it can send anything. The
             // first catalogue row is a working default, and an existing choice
             // is kept so a refresh does not reset it.
@@ -852,10 +1010,13 @@ class MainActivity : ComponentActivity() {
         // 同一会话一次只跑一条；别的会话可以并行，各自往自己的条目里写。
         if (agent.sessionId.isNotEmpty() && agentRuns.containsKey(agent.sessionId)) return
 
-        val workDir = File(agent.workDir).apply { if (!exists()) mkdirs() }
+        val workDir = AgentTools.sanitizeWorkDir(this, agent.workDir).apply { if (!exists()) mkdirs() }
         // A conversation is named after its first prompt, and gets its id at the
         // same moment, so the picker has something to show before it finishes.
-        val sessionId = agent.sessionId.ifEmpty { "s${System.currentTimeMillis()}" }
+        // 毫秒时间戳之外再加随机后缀，避免同一毫秒新建两个会话时互相覆盖。
+        val sessionId = agent.sessionId.ifEmpty {
+            "s${System.currentTimeMillis()}-${(1000..9999).random()}"
+        }
         val title = agent.sessionTitle.ifEmpty { agentStore.titleFor(question) }
         val run = AgentRun(sessionId, title).apply {
             entries = agent.entries + AgentEntry(
@@ -864,6 +1025,7 @@ class MainActivity : ComponentActivity() {
             )
             transcript = agentHistory()
             compaction = lastCompaction
+            approval = agent.approval
         }
         agentRuns[sessionId] = run
         val modelId = agent.modelId
@@ -871,13 +1033,10 @@ class MainActivity : ComponentActivity() {
         val approval = agent.approval
         val maxRounds = agent.maxRounds
         val contextWindow = agent.contextWindow
-        val tools = AgentTools(
-            context = this,
-            workDir = workDir,
-            useRoot = agent.exposeRoot,
-            tooling = ToolingRuntime.get(this).executor,
-            sessionId = sessionId,
-        )
+        val memoryEnabled = agent.memoryEnabled
+        val memoryTopK = agent.memoryTopK
+        val memoryMinScore = agent.memoryMinScore
+        val exposeRoot = agent.exposeRoot
         agent = agent.copy(
             input = "",
             pendingImage = null,
@@ -888,7 +1047,11 @@ class MainActivity : ComponentActivity() {
             pendingApproval = null,
         )
 
+        // 前台服务让进程在调试别的应用时保持前台重要性，否则后台冻结会切断
+        // SSE，会话表现为“自己断了”。
+        AgentRunService.start(this, title)
         agentScope.launch {
+            try {
             val contextEngine = ContextEngine(
                 artifacts = ArtifactStore(this@MainActivity),
                 config = ContextEngine.CompressionConfig(
@@ -903,6 +1066,59 @@ class MainActivity : ComponentActivity() {
             // collected per turn and written to the call log there rather than
             // summed once at the end.
             val result = withContext(Dispatchers.IO) {
+                // 子代理共享父代理的凭据、模型与工作目录；只读工具由 AgentTools 再过滤一层。
+                val subagentRunner = SubagentRunner { tasks, onProgress, isCancelled ->
+                    runSubagents(
+                        tasks = tasks,
+                        credential = credential,
+                        modelId = modelId,
+                        effort = effort,
+                        contextWindow = contextWindow,
+                        sessionId = sessionId,
+                        workDir = workDir,
+                        memoryEnabled = memoryEnabled,
+                        onProgress = onProgress,
+                        isCancelled = isCancelled,
+                    )
+                }
+                // 记忆库与工具在 IO 线程构造：开启记忆时也不阻塞主线程。
+                val tools = AgentTools(
+                    context = this@MainActivity,
+                    workDir = workDir,
+                    useRoot = exposeRoot,
+                    tooling = ToolingRuntime.get(this@MainActivity).executor,
+                    sessionId = sessionId,
+                    remote = ToolWorkerClient.get(this@MainActivity),
+                    memory = if (memoryEnabled) {
+                        MemoryTools(memoryStore, memoryIndexer)
+                    } else {
+                        null
+                    },
+                    memoryEnabled = { agentStore.memoryEnabled() },
+                    subagentRunner = subagentRunner,
+                )
+                // 召回在进入循环前做一次，避免每轮都打乱上游 KV cache。
+                // 纯图片提问时 question 为空，用合成问题兜底，保证仍能召回。
+                val recall = if (memoryEnabled) {
+                    runCatching {
+                        MemorySearch(memoryStore).recall(
+                            query = question.ifBlank { prompt },
+                            sessionId = sessionId,
+                            projectId = "",
+                            topK = memoryTopK,
+                            minScore = memoryMinScore / 100.0,
+                        )
+                    }.getOrNull()
+                } else {
+                    null
+                }
+                // 全局指令每次提问重新读取：改完设置后下一次提问生效，且不写进历史。
+                val preamble = SystemPrompts.compose(
+                    userPrompt = agentStore.systemPrompt(),
+                    memoryPreamble = recall?.takeIf { it.count > 0 }?.preamble,
+                    enabled = agentStore.systemPromptEnabled(),
+                    baseline = agentStore.systemBaseline(),
+                )
                 run.client.run(
                     credential = credential,
                     history = run.transcript,
@@ -912,11 +1128,29 @@ class MainActivity : ComponentActivity() {
                     contextWindow = contextWindow,
                     tools = tools,
                     approval = approval,
+                    approvalProvider = {
+                        if (agent.sessionId == run.id) agent.approval else run.approval
+                    },
                     maxRounds = maxRounds,
                     sessionId = sessionId,
                     initialCompaction = run.compaction,
                     contextEngine = contextEngine,
+                    systemPreamble = preamble,
+                    preambleTokens = ContextBudget.estimateTokens(preamble),
+                    onCompaction = { compaction, archivePath ->
+                        // 发送时开启还不够：长任务中途关掉开关也必须停止写入。
+                        if (memoryEnabled && agentStore.memoryEnabled()) {
+                            memoryIndexer.indexCompaction(
+                                sessionId = sessionId,
+                                projectId = "",
+                                summary = compaction.summary,
+                                archivePath = archivePath,
+                                sourceUpdatedAt = compaction.compactedAt,
+                            )
+                        }
+                    },
                     promptImage = promptImage,
+                    onTranscript = { messages -> run.transcript = messages },
                     ask = { summary -> requestApproval(run, summary) },
                 ) { event ->
                     when (event) {
@@ -951,6 +1185,28 @@ class MainActivity : ComponentActivity() {
                 compaction = result.compaction,
                 setActive = visible,
             )
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // 工具初始化、SQLite、Python 等异常不能直接打崩界面。
+                android.util.Log.e("WBHub", "agent run failed", error)
+                mainHandler.post {
+                    run.answers.offer(false)
+                    agentRuns.remove(run.id)
+                    if (agent.sessionId == run.id) {
+                        agent = agent.copy(running = false, pendingApproval = null)
+                    }
+                    applyAgentEvent(
+                        run,
+                        AgentClient.Event.Failure(
+                            "任务异常终止：${error.message ?: error.javaClass.simpleName}",
+                        ),
+                    )
+                }
+            } finally {
+                // 还有别的会话在跑时保留服务；最后一个结束才撤掉通知。
+                if (agentRuns.isEmpty()) AgentRunService.stop(this@MainActivity)
+            }
         }
     }
 
@@ -1007,6 +1263,17 @@ class MainActivity : ComponentActivity() {
 
             lastAgentTranscript = step.messages
             lastCompaction = step.state
+            step.compaction?.let { info ->
+                if (agentStore.memoryEnabled()) {
+                    memoryIndexer.indexCompaction(
+                        sessionId = sessionId,
+                        projectId = "",
+                        summary = step.state.summary,
+                        archivePath = info.archivePath,
+                        sourceUpdatedAt = step.state.compactedAt,
+                    )
+                }
+            }
 
             val info = step.compaction
             if (info == null) {
@@ -1031,6 +1298,238 @@ class MainActivity : ComponentActivity() {
             persistAgentSession()
         }
     }
+
+    /** 设置页打开或记忆写入后刷新条目数；库的打开、清理与统计都在 IO。 */
+    private fun refreshMemoryStats() {
+        // 关闭记忆时不碰数据库：设置页只显示“已关闭”，查看器打开时才按需读取。
+        if (!agentStore.memoryEnabled()) {
+            if (agent.memoryCount != 0 || agent.memoryBytes != 0L) {
+                agent = agent.copy(memoryCount = 0, memoryBytes = 0)
+            }
+            return
+        }
+        lifecycleScope.launch {
+            val stats = withContext(Dispatchers.IO) {
+                runCatching {
+                    memoryIndexer.cleanup()
+                    memoryStore.stats()
+                }.getOrDefault(MemoryStats())
+            }
+            agent = agent.copy(memoryCount = stats.total, memoryBytes = stats.bytes)
+        }
+    }
+
+    /** 从最近 20 个会话的压缩摘要回填索引；只处理有摘要的会话。 */
+    private fun rebuildMemory() {
+        lifecycleScope.launch {
+            val written = withContext(Dispatchers.IO) {
+                val sessions = agentStore.sessions().take(20)
+                val count = memoryIndexer.rebuild(sessions)
+                memoryIndexer.flush()
+                count
+            }
+            refreshMemoryStats()
+            Toast.makeText(
+                this@MainActivity,
+                "已建立索引：本次写入 $written 条",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    private fun clearMemory() {
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                // 走 memory-io 队列，避免已排队的索引在清空后又写回来。
+                memoryIndexer.clearAll()
+                memoryIndexer.flush()
+            }
+            refreshMemoryStats()
+            Toast.makeText(this@MainActivity, "已清空长期记忆", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 并发执行子代理。
+     *
+     * 只在 IO 线程调用：每个子代理都会阻塞一条线程等待 SSE。子代理共享父代理的
+     * 凭据、模型与工作目录，但只拿到只读工具，因此并发时不会互相覆盖文件，
+     * 也不会弹出并发审批。报告最终拼成一条工具结果交回父代理。
+     */
+    private fun runSubagents(
+        tasks: List<SubagentTask>,
+        credential: Credential,
+        modelId: String,
+        effort: String?,
+        contextWindow: Int,
+        sessionId: String,
+        workDir: File,
+        memoryEnabled: Boolean,
+        onProgress: (String) -> Unit,
+        isCancelled: () -> Boolean,
+    ): SubagentReport {
+        val system = buildString {
+            append(agentStore.systemBaseline().trim())
+            append("\n\n")
+            append(SUBAGENT_RULES)
+        }
+        val total = tasks.size
+        val slots = subagentSemaphore(agentStore.subagentConcurrency())
+        val outcomes = runBlocking {
+            tasks.mapIndexed { index, task ->
+                async(Dispatchers.IO) {
+                    slots.withPermit {
+                        if (isCancelled()) {
+                            SubagentOutcome(task, "", "已停止：未启动")
+                        } else {
+                            runSubagentOnce(
+                                index = index,
+                                total = total,
+                                task = task,
+                                credential = credential,
+                                modelId = modelId,
+                                effort = effort,
+                                contextWindow = contextWindow,
+                                system = system,
+                                sessionId = sessionId,
+                                workDir = workDir,
+                                memoryEnabled = memoryEnabled,
+                                onProgress = onProgress,
+                                isCancelled = isCancelled,
+                            )
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+        val succeeded = outcomes.count { it.error == null && it.text.isNotBlank() }
+        val body = buildString {
+            append("子代理结果：$succeeded/$total 成功（只读，未做任何修改）\n\n")
+            outcomes.forEachIndexed { index, outcome ->
+                append("### [${index + 1}] ${outcome.task.title}\n")
+                if (outcome.text.isNotBlank()) {
+                    append(outcome.text.take(SubagentLimits.MAX_REPORT_CHARS)).append('\n')
+                }
+                when {
+                    outcome.error != null -> append("失败：${outcome.error}\n")
+                    outcome.text.isBlank() -> append("（无文本输出）\n")
+                }
+                append('\n')
+            }
+        }
+        val clipped = if (body.length > SubagentLimits.MAX_TOTAL_REPORT_CHARS) {
+            body.take(SubagentLimits.MAX_TOTAL_REPORT_CHARS) + "\n…（子代理报告已截断）"
+        } else {
+            body
+        }
+        return SubagentReport(clipped, succeeded > 0)
+    }
+
+    /** 跑一个子代理；父代理停止或超时会调用 [AgentClient.cancel] 断开在途请求。 */
+    private suspend fun runSubagentOnce(
+        index: Int,
+        total: Int,
+        task: SubagentTask,
+        credential: Credential,
+        modelId: String,
+        effort: String?,
+        contextWindow: Int,
+        system: String,
+        sessionId: String,
+        workDir: File,
+        memoryEnabled: Boolean,
+        onProgress: (String) -> Unit,
+        isCancelled: () -> Boolean,
+    ): SubagentOutcome = coroutineScope {
+        val client = AgentClient()
+        val failure = AtomicReference<String?>(null)
+        val childSession = "$sessionId-sub${index + 1}"
+        val watcher = launch {
+            val deadline = System.currentTimeMillis() + SubagentLimits.TIMEOUT_MS
+            while (isActive) {
+                if (isCancelled()) {
+                    failure.compareAndSet(null, "已停止")
+                    client.cancel()
+                    break
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    failure.compareAndSet(null, "超时（${SubagentLimits.TIMEOUT_MS / 1000} 秒）")
+                    client.cancel()
+                    break
+                }
+                delay(300)
+            }
+        }
+        onProgress("子代理 ${index + 1}/$total 开始：${task.title}")
+        val result = try {
+            client.run(
+                credential = credential,
+                history = emptyList(),
+                prompt = "子任务：${task.title}\n\n${task.instruction}",
+                modelId = modelId,
+                effort = effort,
+                contextWindow = contextWindow,
+                tools = AgentTools(
+                    context = this@MainActivity,
+                    workDir = workDir,
+                    useRoot = false,
+                    tooling = null,
+                    sessionId = childSession,
+                    remote = null,
+                    memory = if (memoryEnabled) {
+                        MemoryTools(memoryStore, memoryIndexer)
+                    } else {
+                        null
+                    },
+                    memoryEnabled = { agentStore.memoryEnabled() },
+                    readOnly = true,
+                ),
+                approval = ApprovalMode.AUTO,
+                ask = { false },
+                maxRounds = SubagentLimits.MAX_ROUNDS,
+                sessionId = childSession,
+                systemPreamble = system,
+                preambleTokens = ContextBudget.estimateTokens(system),
+                onEvent = { event ->
+                    when (event) {
+                        is AgentClient.Event.Usage -> recordAgentCall(credential, event, modelId)
+                        is AgentClient.Event.Failure -> failure.compareAndSet(null, event.message)
+                        else -> Unit
+                    }
+                },
+            )
+        } catch (error: Throwable) {
+            failure.compareAndSet(null, error.message ?: error.javaClass.simpleName)
+            null
+        } finally {
+            watcher.cancel()
+        }
+        val text = result?.messages
+            ?.lastOrNull { it.role == "assistant" && it.content.isNotBlank() }
+            ?.content.orEmpty().trim()
+        val failureText = failure.get()
+        // 超时/停止后可能已经产出一部分文本：保留它，但标明不完整。
+        val body = buildString {
+            append(text)
+            if (failureText != null && text.isNotBlank()) {
+                if (isNotEmpty()) append("\n\n")
+                append("（$failureText，结果可能不完整）")
+            }
+        }
+        val error = if (text.isBlank()) failureText ?: "没有返回文本" else null
+        onProgress("子代理 ${index + 1}/$total 结束：${task.title}")
+        SubagentOutcome(
+            task = task,
+            text = body.take(SubagentLimits.MAX_REPORT_CHARS),
+            error = error,
+        )
+    }
+
+    private data class SubagentOutcome(
+        val task: SubagentTask,
+        val text: String,
+        val error: String?,
+    )
 
     /**
      * Writes one built-in chat turn to the call history.
@@ -1087,9 +1586,24 @@ class MainActivity : ComponentActivity() {
             // 后台会话的审批不抢屏幕：等用户切到该会话时再弹。
             if (agent.sessionId == run.id) agent = agent.copy(pendingApproval = summary)
         }
-        // A bounded wait keeps a dismissed dialog from wedging the run forever;
-        // timing out counts as a refusal, which is the safe direction.
-        return runCatching { run.answers.poll(5, TimeUnit.MINUTES) }.getOrNull() ?: false
+        // 前台会话最多等 5 分钟；后台会话看不到弹窗，等 60 秒就按拒绝处理，
+        // 否则前台服务与 wake lock 会被一个没人看的审批占住。
+        val deadline = System.currentTimeMillis() + 5 * 60_000L
+        var backgroundSince = 0L
+        while (System.currentTimeMillis() < deadline) {
+            val answer = runCatching {
+                run.answers.poll(500, TimeUnit.MILLISECONDS)
+            }.getOrNull()
+            if (answer != null) return answer
+            val visible = agent.sessionId == run.id
+            if (visible) {
+                backgroundSince = 0L
+            } else {
+                if (backgroundSince == 0L) backgroundSince = System.currentTimeMillis()
+                if (System.currentTimeMillis() - backgroundSince > 60_000L) return false
+            }
+        }
+        return false
     }
 
     /** Records the user's answer and releases the waiting worker. */
@@ -1108,6 +1622,8 @@ class MainActivity : ComponentActivity() {
         agent = agent.copy(pendingApproval = null)
         // 释放可能正在等审批的线程。
         run.answers.offer(false)
+        AgentRunService.update("正在停止…")
+        toast("正在停止…")
     }
 
     /** Probes for root off the main thread, then enables the switch if granted. */
@@ -1174,9 +1690,19 @@ class MainActivity : ComponentActivity() {
             },
             compaction = compaction,
         )
-        agentStore.save(session)
-        if (setActive) agentStore.setActiveSessionId(id)
-        agent = agent.copy(sessions = agentStore.sessions())
+        sessionWriter.execute {
+            runCatching {
+                agentStore.save(session)
+                if (setActive) agentStore.setActiveSessionId(id)
+                val sessions = agentStore.sessions()
+                mainHandler.post { agent = agent.copy(sessions = sessions) }
+            }
+        }
+    }
+
+    /** 等待排队中的会话写盘完成，供 onStop / 退出前调用。 */
+    private fun flushSessions(timeoutMs: Long = 2_000) {
+        runCatching { sessionWriter.submit {}.get(timeoutMs, TimeUnit.MILLISECONDS) }
     }
 
     /** Opens a saved conversation, replacing whatever is on screen. */
@@ -1235,10 +1761,22 @@ class MainActivity : ComponentActivity() {
     private fun deleteAgentSession(id: String) {
         // 删掉正在跑的会话：先停掉，否则后台还会把结果写回磁盘。
         agentRuns.remove(id)?.let { run ->
+            run.deleted = true
             run.client.cancel()
             run.answers.offer(false)
         }
         agentStore.delete(id)
+        // session 作用域的条目跟着会话一起删；project/global 事实保留。
+        // 开关关掉后也要清，否则旧会话的条目会永远留在库里。
+        if (agentStore.memoryEnabled() || AppStorage.memory(this).resolve("memory.db").exists()) {
+            lifecycleScope.launch {
+                withContext(Dispatchers.IO) {
+                    memoryIndexer.flush()
+                    memoryStore.deleteBySession(id)
+                }
+                refreshMemoryStats()
+            }
+        }
         if (agent.sessionId == id) {
             lastAgentTranscript = emptyList()
             lastCompaction = CompactionState()
@@ -1255,14 +1793,37 @@ class MainActivity : ComponentActivity() {
 
     /** Folds one streamed event into the run's own transcript. */
     private fun applyAgentEvent(run: AgentRun, event: AgentClient.Event) {
+        // 删除会话时已经停止并移出 map，但主线程队列里可能还有事件在路上。
+        if (run.deleted) return
         val entries = run.entries.toMutableList()
         var persist = false
         when (event) {
             is AgentClient.Event.Text -> appendStreaming(entries, AgentEntry.Role.ASSISTANT, event.delta)
             is AgentClient.Event.Reasoning -> appendStreaming(entries, AgentEntry.Role.REASONING, event.delta)
-            is AgentClient.Event.ToolStart -> entries += AgentEntry(AgentEntry.Role.TOOL, "▶ ${event.name}")
+            is AgentClient.Event.ToolStart -> {
+                entries += AgentEntry(AgentEntry.Role.TOOL, "▶ ${event.name}")
+                AgentRunService.update("正在执行 ${event.name}")
+            }
+            is AgentClient.Event.ToolProgress -> {
+                // 同一个工具连续上报时只替换最后一行，避免条目无限增长。
+                val line = "… ${event.name}：${event.message}"
+                val last = entries.lastOrNull()
+                if (last != null && last.role == AgentEntry.Role.TOOL && last.text.startsWith("… ")) {
+                    entries[entries.lastIndex] = AgentEntry(AgentEntry.Role.TOOL, line)
+                } else {
+                    entries += AgentEntry(AgentEntry.Role.TOOL, line)
+                }
+                AgentRunService.update("${event.name} · ${event.message}")
+            }
             is AgentClient.Event.ToolEnd -> {
+                while (entries.isNotEmpty() &&
+                    entries.last().role == AgentEntry.Role.TOOL &&
+                    entries.last().text.startsWith("… ")
+                ) {
+                    entries.removeAt(entries.lastIndex)
+                }
                 entries += AgentEntry(AgentEntry.Role.TOOL, "◀ ${event.name}：${event.summary}")
+                AgentRunService.update("${event.name} 已结束，等待模型")
                 // Tool boundaries are the natural save points: they are coarse
                 // enough not to write a file per token, and frequent enough that
                 // a killed process keeps the work up to the last completed call.
@@ -1468,16 +2029,25 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    /** Reloads the recorded calls, newest last. */
+    /** Reloads the recorded calls, newest last. 读盘放在 IO，避免大记录卡主线程。 */
     private fun loadCalls() {
-        val limit = BridgeSettings.callLogLimit(this)
-        state = state.copy(
-            calls = callLog.load(),
-            callsLoaded = true,
-            accountTotals = callLog.totals(),
-            callLogLimit = limit,
-            callLogBytes = callLog.estimatedBytes(limit),
-        )
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                val limit = BridgeSettings.callLogLimit(this@MainActivity)
+                val calls = callLog.load()
+                val totals = callLog.totals()
+                val bytes = callLog.estimatedBytes(limit)
+                withContext(Dispatchers.Main.immediate) {
+                    state = state.copy(
+                        calls = calls,
+                        callsLoaded = true,
+                        accountTotals = totals,
+                        callLogLimit = limit,
+                        callLogBytes = bytes,
+                    )
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ //
@@ -1584,6 +2154,9 @@ class MainActivity : ComponentActivity() {
 
     /** Signs the user out everywhere, discarding both stored credentials. */
     private fun logout() {
+        // 登录轮询可能还在跑：不取消的话，浏览器端完成后会把凭证重新写回来。
+        pollJob?.cancel()
+        pollJob = null
         Wire.Region.entries.forEach { store.clear(it) }
         refreshCredential()
         state = state.copy(models = emptyList(), balance = null, status = "已退出登录")

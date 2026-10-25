@@ -191,7 +191,14 @@ object Wire {
         return obj
     }
 
-    private const val INTERNATIONAL_SYSTEM_PROMPT = "You are a helpful assistant."
+    /**
+     * 国际版网关要求的默认 system 提示词。
+     *
+     * 公开给 Agent 侧：注入长期记忆时会自己补一条 system，若仍走
+     * [prepareInternationalChatBodyObject] 的“首条是 system 就直接返回”，
+     * 默认提示词会被悄悄丢掉。
+     */
+    const val INTERNATIONAL_SYSTEM_PROMPT = "You are a helpful assistant."
 
     // ------------------------------------------------------------------ //
     // Headers

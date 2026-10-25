@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.RemoteInput
 import com.wbhub.app.MainActivity
 import com.wbhub.app.R
+import com.wbhub.app.tools.worker.ToolWorkerClient
 import kotlin.concurrent.thread
 
 /**
@@ -136,14 +137,17 @@ class AdbPairReceiver : BroadcastReceiver() {
         val app = context.applicationContext
         thread(name = "wbhub-adb-pair") {
             try {
-                val paired = AdbSession.pair(app, code)
+                // ADB 会话属于 :tools 进程，配对和连接都要经过它。
+                val client = ToolWorkerClient.get(app)
+                val paired = client.adbPair(code)
                 if (!paired.ok) {
                     AdbPairing.update(app, "配对失败：${paired.text}", done = true)
                     return@thread
                 }
-                val connected = AdbSession.connect(app)
+                val connected = client.adbConnect()
+                val endpoint = client.adbState().endpoint
                 val message = if (connected.ok) {
-                    "配对并连接成功：${AdbSession.endpoint()}（${connected.text.trim()}）"
+                    "配对并连接成功：${endpoint ?: "已连接"}（${connected.text.trim()}）"
                 } else {
                     "配对成功，但连接失败：${connected.text}\n回到设置页会显示具体状态"
                 }

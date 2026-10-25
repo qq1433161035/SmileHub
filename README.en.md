@@ -2,8 +2,6 @@
 
 English | [中文](./README.md)
 
-> Author: weixiao (微笑)
-
 Connect a WorkBuddy account to any OpenAI-compatible client. The app runs a
 local forwarding endpoint on your phone; point your editor, agent, or script at
 it and it works — no official API, and no computer required.
@@ -19,42 +17,43 @@ Phone
      └─ baseUrl = http://127.0.0.1:8765/v1
 ```
 
-## Demo
-
-Bilibili walkthrough: [对开源项目的二次封装](https://www.bilibili.com/video/BV1tKnp6FE7n)
-
 ## Features
 
 - **Account access** through the official CLI's OAuth flow — sign in once and the
-  credential refreshes itself when it expires
+  credential refreshes itself when it expires.
 - **Two builds side by side**: the China and Global builds are separate account
-  systems, so both can be signed in at once and switched between instantly,
-  with no re-login
+  systems, so both can be signed in at once and switched between instantly.
 - **Local forwarding endpoint**, OpenAI-compatible (`/v1/models`,
-  `/v1/chat/completions`) with streaming passed through unchanged
-- **Overlay keep-alive**: a small status panel keeps the app visible so the
-  service is not frozen in the background. It can be dragged, collapsed, and
-  its opacity and position lock are adjustable
-- **Call history**: every call's model, token counts, and credit cost, with
-  totals
-- **Check-in and balance**: view remaining credit and claim the daily check-in
+  `/v1/chat/completions`) with Anthropic Messages and OpenAI Responses formats;
+  SSE streams pass through unchanged.
+- **Overlay keep-alive**: a small, draggable, collapsible status panel keeps the
+  app visible so the service is not frozen in the background.
+- **Call history**: every call's model, token counts, and credit cost, totalled
+  per account.
+- **Check-in and balance**: view remaining credit and claim the daily check-in.
 - **Built-in agent**: read/write files, run shell and Python, and drive the
-  reverse-engineering and device tools from the chat page; sessions run
-  concurrently, with context compaction and stream-resume for long tasks
+  reverse-engineering and device tools from the chat page; concurrent sessions,
+  context compaction, stream resume, cross-session memory, and parallel
+  subagents are included.
 - **Multimodal**: attach an image from the gallery or hand over a path — the
-  model actually sees it
+  model actually sees it.
 - **Self-extending toolbox**: when a built-in tool is not enough, the agent
-  downloads executables, Python packages, or scripts into dedicated
-  directories and calls them right away — no app update needed
+  downloads executables, Python packages, or scripts into dedicated directories
+  and calls them right away — no app update needed.
+- **Reverse-engineering toolchain**: APK decode / rebuild, DEX decompilation,
+  SO parsing and disassembly, signing, and alignment.
+- **Device capabilities**: wireless ADB pairing and shell, accessibility-based
+  UI debugging, screenshots, and UI actions.
 
-The list above is only an overview. Multimodal input, concurrent sessions, the
-built-in agent toolchain, self-extension, reverse engineering, ADB, and the
-Python runtime are documented in full in [docs/FEATURES.md](./docs/FEATURES.md).
+## Requirements
+
+| Item | Requirement |
+| --- | --- |
+| Runtime | Android 8.0 (API 26) or later, arm64-v8a |
+| Build | JDK 21, Android SDK platform 35, and build-tools |
+| Gradle | Bundled wrapper; no separate installation needed |
 
 ## Build
-
-Requires JDK 21 and an Android SDK (with platform 35 and build-tools). Gradle
-comes from the project's wrapper, so it does not need to be installed.
 
 ### Linux / macOS
 
@@ -74,9 +73,17 @@ In PowerShell:
 
 Adjust the SDK path in `local.properties` to match your installation.
 
-The APK lands in `app/build/outputs/apk/debug/app-debug.apk`.
+- Debug APK: `app/build/outputs/apk/debug/app-debug.apk`
+- Unit tests: `./gradlew test`
+- Release APK: `./gradlew assembleRelease`
 
-### Install on a device
+Release builds enable R8 and resource shrinking by default. Signing material is
+read from `keystore.properties` (`storeFile`, `storePassword`, `keyAlias`,
+`keyPassword`); that file is git-ignored. Without it the output is
+`app-release-unsigned.apk` — a debug-keystore signature is fine for a smoke
+test, but do not distribute such a build.
+
+## Install
 
 ```sh
 adb install -r app/build/outputs/apk/debug/app-debug.apk
@@ -84,12 +91,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## Usage
 
-1. **Sign in**: open the app → "Credential" → pick a build → tap sign in and
-   complete the login in your browser
-2. **Start the service**: "API" → turn the switch on
+1. **Sign in**: open the app → "Profile" → pick a build → tap sign in and
+   complete the authorization in your browser.
+2. **Start the service**: "API" → turn the switch on.
 3. **Grant the overlay**: tap "Enable overlay" and allow it. This is what keeps
-   the service alive in the background
-4. **Point your client at it**: the "API" page shows the baseUrl and apiKey
+   the service alive in the background.
+4. **Point your client at it**: the "API" page shows the `baseUrl` and `apiKey`.
 
 ### Client configuration
 
@@ -110,38 +117,39 @@ A `models.json`-style example:
 }
 ```
 
-Model names are listed on the app's "API" page; tapping one copies it.
+Model names are listed on the app's "API" page; tapping one copies it. A local
+key is generated randomly on first run and can be viewed, copied, or changed in
+Settings.
 
 ## Why the overlay is needed
 
 Android freezes a backgrounded app's process, and a frozen process stops serving
 requests — which shows up as client timeouts. A foreground service is not enough
-to prevent this: in this project's testing the service was still frozen and
-still timed out.
-
-An overlay keeps the app in the "visible" state, which raises its process
-importance enough that it is no longer frozen. This needs no root and no extra
-tooling — one permission grant in system settings.
+to prevent this; an overlay keeps the app in the "visible" state, which raises
+its process importance enough that it is no longer frozen. This needs no root —
+one permission grant in system settings.
 
 ## How it works
 
 ```
 client request
-  │  OpenAI protocol
+  │  OpenAI / Anthropic / Responses protocol
   ▼
 local forwarding endpoint (127.0.0.1:8765)
   │  ① reshape the body (the upstream requires stream, rejects the developer role)
   │  ② add the WorkBuddy-specific identity headers
   │  ③ attach your access token
   ▼
-WorkBuddy upstream (copilot.tencent.com / www.workbuddy.ai)
+WorkBuddy upstream
   │  SSE stream
   ▼
 passed through to the client unchanged
 ```
 
 The endpoint listens on `127.0.0.1` only and requires a shared secret on every
-request, so other apps on the device cannot call it.
+request, so other apps on the device cannot call it. LAN access can be enabled
+in Settings with a separate LAN key, and an HTTPS listener can be served on
+`port + 1`.
 
 The upstream endpoints are the private ones the WorkBuddy client uses, not a
 public API. An upstream change can break the integration and would need
@@ -199,41 +207,50 @@ minSdk 26 · targetSdk 28 · arm64-v8a only.
 All libraries remain under their respective licenses; follow each project's
 terms when redistributing.
 
+## Privacy
+
+- Credentials, sessions, memory, and settings stay on the device; nothing is
+  uploaded or synced.
+- Credentials, ADB keys, the TLS CA key, and signing keys live in the app's
+  private directory, never in shared storage.
+- Sessions and call history are stored locally and can be inspected, backed up,
+  or deleted by the user.
+
+## Known limitations
+
+- Depends on private WorkBuddy endpoints, which may need adapting after an
+  upstream update.
+- Overlay keep-alive depends on how the system judges importance; aggressive
+  background policies may still restrict it.
+- The built-in toolchain and Python runtime ship for arm64-v8a only.
+- `targetSdk 28` is what allows executing ELF binaries downloaded into the
+  private directory; in exchange, newer storage, notification, and foreground
+  service restrictions do not apply.
+- Verified on Android only.
+
+## Disclaimer
+
+- This project is for personal study and research only, and drives only the
+  user's own account from their own device.
+- Users must comply with WorkBuddy's terms of service; any consequence of using
+  this project is the user's own responsibility.
+- This project is not affiliated with, authorized by, or endorsed by Tencent or
+  WorkBuddy; names are used only to describe compatibility.
+
+## Contributing
+
+- This project is open-sourced as-is; no bugs will be fixed and no feature
+  requests will be accepted.
+- Issues and pull requests are kept for reference only; replies and merges are
+  not guaranteed.
+- Author: weixiao (微笑) · QQ: 791940981
+
 ## References
 
 - [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)
 - [xc3qaq/WorkBuddy-Hub-Android](https://github.com/xc3qaq/WorkBuddy-Hub-Android)
 
 Thanks to both projects for reference on protocol adaptation and design.
-
-## Author
-
-- weixiao (微笑)
-- QQ: 791940981
-
-## Known limitations
-
-- Overlay keep-alive depends on how the system judges importance; aggressive
-  background policies may still restrict it
-- A Global account may need its trial activated in the official client first,
-  otherwise the upstream refuses billing-related requests
-- Depends on private WorkBuddy endpoints, which may need adapting after an
-  upstream update
-- Verified on Android only
-
-## Disclaimer
-
-- This project is for personal study and research only, and drives only the
-  user's own account from their own device
-- Users must comply with WorkBuddy's terms of service; any consequence of using
-  this project is the user's own responsibility
-- This project is not affiliated with, authorized by, or endorsed by Tencent or
-  WorkBuddy; names are used only to describe compatibility
-
-## Maintenance
-
-Build, release, layout, troubleshooting and known debt:
-[docs/MAINTENANCE.md](./docs/MAINTENANCE.md).
 
 ## License
 

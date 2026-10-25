@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- 工作区在共享存储 /storage/emulated/0/WBHub 下，重打包产物也在这里。 -->
-    <external-path name="wbhub" path="WBHub/" />
-    <files-path name="files" path="." />
-    <cache-path name="cache" path="." />
+    <!-- 只暴露工作区，任务产物都在这里。 -->
+    <external-path name="wbhub_workspace" path="WBHub/workspace/" />
+    <!-- 无共享存储权限时工作区回退到私有目录，同样只暴露 workspace。 -->
+    <files-path name="wbhub_private_workspace" path="WBHub/workspace/" />
 </paths>

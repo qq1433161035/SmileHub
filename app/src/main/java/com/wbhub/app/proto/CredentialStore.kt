@@ -134,7 +134,7 @@ class CredentialStore(context: Context) {
                 },
             )
         }
-        fileFor(region).writeText(array.toString())
+        AppStorage.writeAtomically(fileFor(region), array.toString())
     }
 
     /**
@@ -200,7 +200,6 @@ class CredentialStore(context: Context) {
 
     fun setActiveRegion(region: Wire.Region) {
         prefs.edit().putString(KEY_ACTIVE_REGION, region.name).apply()
-        mirrorActiveForDaemon()
     }
 
     /**
@@ -220,7 +219,6 @@ class CredentialStore(context: Context) {
 
     private fun setActive(region: Wire.Region, accountId: String) {
         prefs.edit().putString("$KEY_ACTIVE_ID${region.name}", accountId).apply()
-        mirrorActiveForDaemon()
     }
 
     private fun clearActive(region: Wire.Region) {
@@ -249,8 +247,15 @@ class CredentialStore(context: Context) {
 
     fun needsRefresh(credential: Credential): Boolean {
         if (credential.expiresAt <= 0) return true
+        // 不同来源的 expiresAt 有秒也有毫秒；统一成秒再比较，否则毫秒值永远
+        // 不会触发刷新。
+        val expiresSeconds = if (credential.expiresAt > 1_000_000_000_000L) {
+            credential.expiresAt / 1000
+        } else {
+            credential.expiresAt
+        }
         val nowSeconds = System.currentTimeMillis() / 1000
-        return nowSeconds + REFRESH_MARGIN_SECONDS >= credential.expiresAt
+        return nowSeconds + REFRESH_MARGIN_SECONDS >= expiresSeconds
     }
 
     /**
@@ -284,36 +289,6 @@ class CredentialStore(context: Context) {
         }
     }
 
-    /**
-     * Publishes the account in use to the path a local consumer reads.
-     * Only the active account is mirrored, which keeps the others' tokens out of
-     * a world-readable location.
-     */
-    fun mirrorActiveForDaemon() {
-        val target = File(DAEMON_AUTH_PATH)
-        val credential = active()
-        runCatching {
-            target.parentFile?.mkdirs()
-            if (credential == null) {
-                if (target.exists()) target.delete()
-                return@runCatching
-            }
-            val json = JSONObject().apply {
-                put("accessToken", credential.accessToken)
-                put("refreshToken", credential.refreshToken)
-                put("expiresAt", credential.expiresAt)
-                put("domain", credential.domain)
-                put("uid", credential.uid)
-                put("nickname", credential.nickname)
-                put("enterpriseId", credential.enterpriseId ?: "")
-            }
-            target.writeText(json.toString(2))
-            // A local consumer may run as another user, so the copy has to be
-            // readable by it.
-            target.setReadable(true, false)
-        }
-    }
-
     private fun defaultDomain(region: Wire.Region): String =
         if (region == Wire.Region.GLOBAL) "www.workbuddy.ai" else Wire.CN_CHAT_BASE
 
@@ -330,9 +305,6 @@ class CredentialStore(context: Context) {
     }
 
     companion object {
-        /** Where a local consumer expects the account in use. */
-        const val DAEMON_AUTH_PATH = "/data/local/tmp/wb-hub/wb-auth.json"
-
         private const val KEY_ACTIVE_REGION = "active_region"
         private const val KEY_ACTIVE_ID = "active_account_"
 

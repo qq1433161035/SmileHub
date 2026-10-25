@@ -52,6 +52,8 @@ fun HubApp(
     onStopBridge: () -> Unit,
     onLogin: (Wire.Region) -> Unit,
     onLogout: () -> Unit,
+    onConfirmLogout: () -> Unit,
+    onDismissLogout: () -> Unit,
     onClearCalls: () -> Unit,
     onOpenCallSettings: () -> Unit,
     onOpenModelStats: () -> Unit,
@@ -84,7 +86,17 @@ fun HubApp(
     onAgentSelectCompactTrigger: (Int) -> Unit,
     onAgentSelectCompactKeep: (Int) -> Unit,
     onAgentSelectOffloadChars: (Int) -> Unit,
+    onAgentToggleSystemPrompt: (Boolean) -> Unit,
+    onAgentSaveSystemPrompt: (String) -> Unit,
+    onAgentSaveSystemBaseline: (String) -> Unit,
+    onAgentSelectSubagentConcurrency: (Int) -> Unit,
     onAgentCompactNow: () -> Unit,
+    onAgentToggleMemory: (Boolean) -> Unit,
+    onAgentSelectMemoryTopK: (Int) -> Unit,
+    onAgentSelectMemoryMinScore: (Int) -> Unit,
+    onAgentRebuildMemory: () -> Unit,
+    onAgentClearMemory: () -> Unit,
+    onAgentRefreshMemory: () -> Unit,
     onAgentRequestStorage: () -> Unit,
     onAgentNewSession: () -> Unit,
     onAgentOpenSession: (String) -> Unit,
@@ -136,13 +148,12 @@ fun HubApp(
     // Reporting the visible tab lets the host reload that page's data on entry,
     // which is what keeps the call history current without a restart.
     LaunchedEffect(tab) { onTabShown(HubTab.entries[tab]) }
-    var dark by remember { mutableStateOf(false) }
     // The 工程 page is a full-screen layer; system back should leave it before
     // it leaves the app.
     BackHandler(enabled = state.showTooling) { onCloseTooling() }
 
     MaterialExpressiveTheme(
-        colorScheme = if (dark) darkColorScheme() else expressiveLightColorScheme(),
+        colorScheme = expressiveLightColorScheme(),
         motionScheme = MotionScheme.expressive(),
     ) {
         val background = MaterialTheme.colorScheme.background
@@ -284,7 +295,17 @@ fun HubApp(
                             onSelectCompactTrigger = onAgentSelectCompactTrigger,
                             onSelectCompactKeep = onAgentSelectCompactKeep,
                             onSelectOffloadChars = onAgentSelectOffloadChars,
+                            onToggleSystemPrompt = onAgentToggleSystemPrompt,
+                            onSaveSystemPrompt = onAgentSaveSystemPrompt,
+                            onSaveSystemBaseline = onAgentSaveSystemBaseline,
+                            onSelectSubagentConcurrency = onAgentSelectSubagentConcurrency,
                             onCompactNow = onAgentCompactNow,
+                            onToggleMemory = onAgentToggleMemory,
+                            onSelectMemoryTopK = onAgentSelectMemoryTopK,
+                            onSelectMemoryMinScore = onAgentSelectMemoryMinScore,
+                            onRebuildMemory = onAgentRebuildMemory,
+                            onClearMemory = onAgentClearMemory,
+                            onMemoryChanged = onAgentRefreshMemory,
                             onToggleRoot = onAgentToggleRoot,
                             onRequestStorage = onAgentRequestStorage,
                         )
@@ -336,6 +357,13 @@ fun HubApp(
                 onLimitChange = onCallLimitChange,
             )
         }
+        if (state.showLogoutConfirm) {
+            LogoutDialog(
+                onConfirm = onConfirmLogout,
+                onDismiss = onDismissLogout,
+            )
+        }
+
         if (showHelp) {
             HelpDialog(
                 state = state,

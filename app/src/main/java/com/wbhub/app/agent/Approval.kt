@@ -41,7 +41,8 @@ enum class ApprovalMode(val label: String, val description: String) {
 object ToolPolicy {
 
     /** Whether the call only reads state and cannot change the device. */
-    fun isReadOnly(name: String): Boolean = name == "read" || name == "view_image"
+    fun isReadOnly(name: String): Boolean =
+        name == "read" || name == "view_image" || name == "memory_search" || name == "memory_list"
 
     /** Whether the call needs the user's answer under [mode]. */
     fun needsApproval(mode: ApprovalMode, name: String): Boolean = when (mode) {
@@ -66,6 +67,12 @@ object ToolPolicy {
     fun summarize(name: String, args: Map<String, Any?>): String = when (name) {
         "read" -> "读取 ${args["path"] ?: "?"}"
         "view_image" -> "查看图片 ${args["path"] ?: "?"}"
+        // 不显示正文：敏感内容在写入前才会被过滤，审批弹窗不应先泄露一遍。
+        "memory_save" -> "记住一条长期记忆（${(args["text"] as? String)?.length ?: 0} 字）"
+        "memory_update" -> "更新记忆 ${args["id"] ?: "?"}"
+        "memory_search" -> "检索记忆：${args["query"] ?: "?"}"
+        "memory_list" -> "列出记忆"
+        "memory_forget" -> "删除记忆 ${args["id"] ?: args["query"] ?: "?"}"
         "write" -> "写入 ${args["path"] ?: "?"}（${(args["content"] as? String)?.length ?: 0} 字符）"
         "edit" -> "编辑 ${args["path"] ?: "?"}"
         "bash" -> "执行命令：${args["command"] ?: "?"}"
@@ -98,6 +105,21 @@ object ToolPolicy {
             "安装 ${args["path"] ?: "?"}"
         }
         "apk_uninstall" -> "卸载 ${args["package"] ?: "?"}（会清除应用数据）"
+        "ui_status" -> "查看界面调试状态"
+        "ui_dump" -> "读取界面结构" + (args["package"]?.let { "（$it）" } ?: "")
+        "ui_wait" -> "等待界面变化"
+        "screenshot" -> "截取当前屏幕"
+        "ui_act" -> when (args["action"]) {
+            "click" -> "点击 ${args["ref"] ?: "?"}"
+            "long_click" -> "长按 ${args["ref"] ?: "?"}"
+            "set_text" -> "向 ${args["ref"] ?: "?"} 写入：${(args["text"] as? String)?.take(20).orEmpty()}"
+            "clear_text" -> "清空 ${args["ref"] ?: "?"}"
+            "scroll" -> "滚动 ${args["ref"] ?: "?"}"
+            "tap" -> "点击坐标 (${args["x"]}, ${args["y"]})"
+            "swipe" -> "滑动 (${args["x1"]}, ${args["y1"]}) → (${args["x2"]}, ${args["y2"]})"
+            "key" -> "按键：${args["key"] ?: "?"}"
+            else -> "界面操作 ${args["action"] ?: "?"}"
+        }
         else -> "$name " + args.entries.joinToString(" ") { "${it.key}=${it.value}" }
     }
 }

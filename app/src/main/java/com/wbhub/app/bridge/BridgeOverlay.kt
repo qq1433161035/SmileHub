@@ -166,6 +166,8 @@ class BridgeOverlay(
     private lateinit var detailView: TextView
     private lateinit var logView: TextView
     private lateinit var root: LinearLayout
+    /** 面板/圆点的实际内容视图：背景与透明度画在它身上，不是外层容器。 */
+    private var contentView: View? = null
 
     /**
      * The dot's view and its drawable, kept so a blink can repaint the shape
@@ -264,6 +266,7 @@ class BridgeOverlay(
         windowManager = wm
 
         val content: View = if (stealthMode) buildDot() else buildPanel()
+        contentView = content
         root = LinearLayout(context).apply { addView(content) }
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -428,6 +431,7 @@ class BridgeOverlay(
                         if (moved) {
                             lp.x = startX + dx.roundToInt()
                             lp.y = startY + dy.roundToInt()
+                            clampToScreen(lp)
                             runCatching { windowManager?.updateViewLayout(root, lp) }
                         }
                     }
@@ -440,6 +444,7 @@ class BridgeOverlay(
                     if (!moved) {
                         if (!stealthMode) toggleExpanded()
                     } else if (!locked || (stealthMode && adjusting)) {
+                        clampToScreen(lp)
                         if (stealthMode) {
                             BridgeSettings.setDotPosition(context, lp.x, lp.y)
                             // The user just chose a new home position, so the
@@ -565,6 +570,7 @@ class BridgeOverlay(
         val v = view ?: return
         runCatching { windowManager?.removeView(v) }
         view = null
+        contentView = null
     }
 
     fun isShowing(): Boolean = view != null
@@ -603,9 +609,12 @@ class BridgeOverlay(
 
     /** Paints the panel background at the current opacity. */
     private fun applyBackground() {
-        val drawable = (root.background as? GradientDrawable) ?: return
+        // 背景设在 content（buildPanel），外层 root 没有 drawable；读 root 会让
+        // 透明度滑块永远无效。
+        val content = contentView ?: return
+        val drawable = (content.background as? GradientDrawable) ?: return
         drawable.setColor(withAlpha(Color.parseColor("#1A2233"), panelOpacity))
-        root.invalidate()
+        content.invalidate()
     }
 
     /** Applies the configured opacity to a base colour. */
@@ -614,6 +623,15 @@ class BridgeOverlay(
         // would defeat its own purpose.
         val a = (alpha.coerceIn(0f, 1f) * 255).toInt()
         return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
+    }
+
+    /** 拖动时把窗口限制在屏幕内，避免坐标持久化到屏幕外再也找不回来。 */
+    private fun clampToScreen(lp: WindowManager.LayoutParams) {
+        val metrics = context.resources.displayMetrics
+        val width = root.width.takeIf { it > 0 } ?: root.measuredWidth
+        val height = root.height.takeIf { it > 0 } ?: root.measuredHeight
+        if (width > 0) lp.x = lp.x.coerceIn(0, (metrics.widthPixels - width).coerceAtLeast(0))
+        if (height > 0) lp.y = lp.y.coerceIn(0, (metrics.heightPixels - height).coerceAtLeast(0))
     }
 
     private fun dp(value: Int): Int =

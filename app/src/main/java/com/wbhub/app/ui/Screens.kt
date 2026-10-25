@@ -243,6 +243,8 @@ private fun LazyListScope.credentialItems(
                     selected = region == item,
                     onClick = { onSwitchRealm(item) },
                     shape = SegmentedButtonDefaults.itemShape(index = index, count = Wire.Region.entries.size),
+                    // 选中态不显示对勾，只靠底色区分。
+                    icon = {},
                 ) {
                     Text(if (count > 0) "${realmName(item)} $count" else realmName(item))
                 }
@@ -951,19 +953,6 @@ private fun BonusButton(
     }
 }
 
-/** Modal shown when a check-in or bonus routine finishes. */
-@Composable
-fun CheckinDialog(message: String, onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("执行结果") },
-        text = { Text(message) },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("好") }
-        },
-    )
-}
-
 /** Integration guide shown from the help icon. */
 @Composable
 fun HelpDialog(state: HubState, onDismiss: () -> Unit, onCopyEndpoint: () -> Unit) {
@@ -1151,7 +1140,8 @@ private fun LazyListScope.callItems(
                 TextButton(onClick = onOpenModelStats) { Text("模型调用频率") }
             }
         }
-        items(records.reversed(), key = { it.timestamp.toString() + it.model }) { record ->
+        // 同一毫秒、同一模型的两条记录会产生重复 key，直接崩在 LazyColumn 里。
+        items(records.reversed()) { record ->
             CallRow(record, state.models)
         }
     }

@@ -21,6 +21,14 @@ class ToolingDb(context: Context) : SQLiteOpenHelper(
     VERSION,
 ) {
 
+    override fun onConfigure(db: SQLiteDatabase) {
+        super.onConfigure(db)
+        // 主进程（工程页）与 :tools 会同时读写同一个库：WAL + busy_timeout
+        // 让并发写退化成短暂等待，而不是直接 SQLITE_BUSY。
+        runCatching { db.enableWriteAheadLogging() }
+        runCatching { db.rawQuery("PRAGMA busy_timeout=5000", null).use { it.moveToFirst() } }
+    }
+
     data class ProjectRow(
         val id: String,
         val name: String,

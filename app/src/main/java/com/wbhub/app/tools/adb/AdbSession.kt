@@ -58,6 +58,10 @@ object AdbSession {
     private val _state = MutableStateFlow(State(false, null, "未连接"))
     val state: StateFlow<State> = _state.asStateFlow()
 
+    /** 实时状态：`state` 只在动作发生时更新，Wi-Fi 切换后会是旧值。 */
+    @Synchronized
+    fun currentState(): State = State(connected(), endpoint(), _state.value.message)
+
     @Synchronized
     fun endpoint(): String? = endpoint
 
@@ -186,7 +190,11 @@ object AdbSession {
             }
         return try {
             val output = shellOn(instance, command, timeoutSeconds)
-            if (output.startsWith("E_TIMEOUT:")) Result(false, output) else Result(true, output)
+            if (output.startsWith("E_TIMEOUT:") || output.startsWith("E_IO:")) {
+                Result(false, output)
+            } else {
+                Result(true, output)
+            }
         } catch (error: Throwable) {
             drop()
             publish("ADB 命令失败：${describe(error)}")
@@ -210,44 +218,58 @@ object AdbSession {
         return shell(context, command, timeoutSeconds)
     }
 
+    private data class ShellRead(
+        val bytes: ByteArray,
+        val interrupted: Boolean,
+        val truncated: Boolean,
+    )
+
     private fun shellOn(instance: AbsAdbConnectionManager, command: String, timeoutSeconds: Long): String {
         val stream: AdbStream = instance.openStream("shell:$command")
         val executor = Executors.newSingleThreadExecutor()
         try {
-            val future = executor.submit<ByteArray> { readAll(stream) }
-            val output = try {
+            val future = executor.submit<ShellRead> { readAll(stream) }
+            val read = try {
                 future.get(timeoutSeconds.coerceIn(1, 600), TimeUnit.SECONDS)
             } catch (timeout: TimeoutException) {
                 future.cancel(true)
                 return "E_TIMEOUT: 命令在 ${timeoutSeconds}s 内没有结束"
             }
-            // 空输出 + 连接已经掉了 = adbd 掐断了会话，不能当成命令成功。
-            if (output.isEmpty() && !instance.isConnected) {
-                throw java.io.IOException("ADB 会话被 adbd 中断")
+            val text = read.bytes.toString(Charsets.UTF_8)
+            val suffix = buildString {
+                if (read.truncated) append("\n… 输出超过 200KB，已截断")
+                if (read.interrupted) append("\n(ADB 连接中断，输出可能不完整)")
             }
-            return output.toString(Charsets.UTF_8)
+            // 读流被掐断、或空输出且连接已掉：不能当成命令成功，否则模型会把
+            // 半截结果当完整结果继续用。
+            if (read.interrupted || (read.bytes.isEmpty() && !instance.isConnected)) {
+                return "E_IO: ADB 会话被 adbd 中断$suffix\n$text"
+            }
+            return text + suffix
         } finally {
             executor.shutdownNow()
             runCatching { stream.close() }
         }
     }
 
-    private fun readAll(stream: AdbStream): ByteArray {
+    private fun readAll(stream: AdbStream): ShellRead {
         val output = ByteArrayOutputStream()
         val input = stream.openInputStream()
         val buffer = ByteArray(8 * 1024)
+        var interrupted = false
         while (output.size() < MAX_OUTPUT) {
-            // libadb 在流正常结束和被掐断时都抛 "Stream closed."，只能靠
-            // 连接状态区分；这里先按结束处理，交给调用方判断。
+            // libadb 在流正常结束和被掐断时都抛 "Stream closed."；这里记录下来，
+            // 由 shellOn 决定是否按失败返回。
             val read = try {
                 input.read(buffer)
             } catch (closed: java.io.IOException) {
+                interrupted = true
                 break
             }
             if (read < 0) break
             output.write(buffer, 0, read)
         }
-        return output.toByteArray()
+        return ShellRead(output.toByteArray(), interrupted, output.size() >= MAX_OUTPUT)
     }
 
     /** 阻塞式 mDNS 发现，返回第一个解析到的 host:port。 */
@@ -307,8 +329,7 @@ object AdbSession {
         return Triple(host, port, code)
     }
 
-    private fun keyDir(context: Context): File =
-        File(AppStorage.root(context), "adb").apply { mkdirs() }
+    private fun keyDir(context: Context): File = AppStorage.adb(context)
 
     private fun describe(error: Throwable): String = when (error) {
         is AdbPairingRequiredException ->
@@ -345,7 +366,7 @@ object AdbSession {
     private class AdbKeys(val privateKey: PrivateKey, val certificate: X509Certificate) {
         companion object {
             fun load(context: Context): AdbKeys {
-                val dir = File(AppStorage.root(context), "adb").apply { mkdirs() }
+                val dir = AppStorage.adb(context)
                 val keyFile = File(dir, "client.key")
                 val certFile = File(dir, "client.crt")
                 // adblib 时代的裸 DER 文件不再使用，避免和证书密钥混淆

@@ -179,27 +179,31 @@ object BridgeSettings {
     const val DEFAULT_CALL_LIMIT = 500
 
     /**
-     * The key local clients present. Fixed: it is written into configs on this
-     * device and there is nothing to gain from rotating it.
-     */
-    const val DEFAULT_API_KEY = "wb-local"
-
-    /**
-     * The key local clients present.
+     * 首次使用随机生成，不再用公开常量。
      *
-     * Stored rather than fixed so a user can rotate it; the default keeps a
-     * fresh install usable without visiting this screen.
+     * 固定 `wb-local` 意味着同机任何应用、同网段任何设备都能直接调用并消耗
+     * 账号额度；随机值会随设置页展示，用户复制到客户端即可。
      */
-    fun apiKey(context: Context): String =
-        AppStorage.prefs(context, PREFS)
-            .getString(KEY_API_KEY, "")
-            ?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_API_KEY
+    fun apiKey(context: Context): String {
+        val prefs = AppStorage.prefs(context, PREFS)
+        prefs.getString(KEY_API_KEY, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        val generated = randomKey("wb-")
+        prefs.edit().putString(KEY_API_KEY, generated).apply()
+        return generated
+    }
 
     fun setApiKey(context: Context, value: String) {
-        val trimmed = value.trim().ifBlank { DEFAULT_API_KEY }
+        val trimmed = value.trim().ifBlank { randomKey("wb-") }
         AppStorage.prefs(context, PREFS)
             .edit().putString(KEY_API_KEY, trimmed).apply()
+    }
+
+    private fun randomKey(prefix: String): String {
+        val bytes = ByteArray(18).also { java.security.SecureRandom().nextBytes(it) }
+        return prefix + android.util.Base64.encodeToString(
+            bytes,
+            android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+        )
     }
 
     /**
@@ -230,19 +234,19 @@ object BridgeSettings {
      * network is the one worth being able to change, and keeping it distinct
      * means revoking peer access does not disturb this device's own clients.
      */
-    fun lanKey(context: Context): String =
-        AppStorage.prefs(context, PREFS)
-            .getString(KEY_LAN_KEY, "")
-            ?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_LAN_KEY
+    fun lanKey(context: Context): String {
+        val prefs = AppStorage.prefs(context, PREFS)
+        prefs.getString(KEY_LAN_KEY, null)?.takeIf { it.isNotBlank() }?.let { return it }
+        val generated = randomKey("wbl-")
+        prefs.edit().putString(KEY_LAN_KEY, generated).apply()
+        return generated
+    }
 
     fun setLanKey(context: Context, value: String) {
-        val trimmed = value.trim()
+        val trimmed = value.trim().ifBlank { randomKey("wbl-") }
         AppStorage.prefs(context, PREFS)
             .edit().putString(KEY_LAN_KEY, trimmed).apply()
     }
-
-    const val DEFAULT_LAN_KEY = "wb-lan"
 
     /**
      * Whether the endpoint is reachable from the local network.

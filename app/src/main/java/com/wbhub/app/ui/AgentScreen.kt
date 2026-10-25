@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -345,7 +346,11 @@ private fun ChipPicker(
                     trailingIcon = if (onDelete != null && id != NEW_SESSION) {
                         {
                             IconButton(onClick = { onDelete(id) }) {
-                                Icon(Icons.Default.Delete, contentDescription = "删除会话")
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "删除会话",
+                                    tint = MaterialTheme.colorScheme.error,
+                                )
                             }
                         }
                     } else {
@@ -532,11 +537,14 @@ private fun ApprovalDialog(summary: String, onAnswer: (Boolean) -> Unit) {
         ),
         title = { Text("允许此操作？") },
         text = {
-            Text(
-                summary,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-            )
+            // 长按可选、可复制：用户经常需要把命令贴出来核对。
+            SelectionContainer {
+                Text(
+                    summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
         },
         confirmButton = { TextButton(onClick = { onAnswer(true) }) { Text("允许") } },
         dismissButton = { TextButton(onClick = { onAnswer(false) }) { Text("拒绝") } },

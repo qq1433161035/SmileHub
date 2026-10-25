@@ -16,7 +16,6 @@ import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
@@ -83,8 +82,31 @@ class BridgeServer(
     /** Upper bound on a request body, so one client cannot exhaust memory. */
     private val requestBodyLimit = 64 * 1024 * 1024
 
+    /** 单行 header 与总 header 的上限，挡住未鉴权阶段的慢速/超长请求。 */
+    private val maxHeaderLine = 8 * 1024
+    private val maxHeaderBytes = 64 * 1024
+    private val maxHeaders = 128
+
+    /** 已接受的连接：stop() 要能一起关掉，否则重启后旧连接继续占着线程。 */
+    private val active = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<Socket, Boolean>(),
+    )
+
     private val running = AtomicBoolean(false)
-    private val pool = Executors.newCachedThreadPool()
+
+    /**
+     * 有界线程池：流式回答会长期占用线程，无界池在并发打满时只会把内存和
+     * 上游配额一起拖垮。队列满后直接拒绝并关掉连接。
+     */
+    private val pool = java.util.concurrent.ThreadPoolExecutor(
+        2,
+        16,
+        60L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue(64),
+        { runnable -> Thread(runnable, "wbhub-bridge").apply { isDaemon = true } },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy(),
+    )
     private val client = UpstreamClient()
     private var server: ServerSocket? = null
     private var tlsServer: ServerSocket? = null
@@ -165,7 +187,20 @@ class BridgeServer(
                     if (running.get()) android.util.Log.w(TAG, "accept failed", e)
                     continue
                 }
-                pool.submit { handle(accepted) }
+                this.active.add(accepted)
+                try {
+                    pool.execute {
+                        try {
+                            handle(accepted)
+                        } finally {
+                            this.active.remove(accepted)
+                        }
+                    }
+                } catch (rejected: java.util.concurrent.RejectedExecutionException) {
+                    android.util.Log.w(TAG, "bridge pool saturated; dropping connection")
+                    this.active.remove(accepted)
+                    runCatching { accepted.close() }
+                }
             }
         }.apply { isDaemon = true; start() }
     }
@@ -174,6 +209,9 @@ class BridgeServer(
         running.set(false)
         runCatching { server?.close() }
         runCatching { tlsServer?.close() }
+        // 只关监听 socket 不够：已接受的连接会继续阻塞在读写上，线程与 FD 都不释放。
+        active.forEach { runCatching { it.close() } }
+        active.clear()
         pool.shutdownNow()
     }
 
@@ -182,27 +220,24 @@ class BridgeServer(
         val output = BufferedOutputStream(socket.getOutputStream())
         try {
             socket.soTimeout = 30_000
-            val requestLine = readLine(input) ?: return
+            val requestLine = readLine(input, maxHeaderLine) ?: return
             val headers = HashMap<String, String>()
+            var headerBytes = 0
+            var headerCount = 0
             while (true) {
-                val line = readLine(input) ?: return
+                val line = readLine(input, maxHeaderLine) ?: return
                 if (line.isEmpty()) break
+                headerBytes += line.length + 2
+                if (headerBytes > maxHeaderBytes || ++headerCount > maxHeaders) {
+                    runCatching { sendJson(output, 413, """{"error":{"message":"headers too large"}}""") }
+                    return
+                }
                 val idx = line.indexOf(':')
                 if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
             }
-            val length = headers["content-length"]?.toIntOrNull() ?: 0
-            val body = if (length > 0) {
-                val buffer = ByteArray(length)
-                var read = 0
-                while (read < length) {
-                    val n = input.read(buffer, read, length - read)
-                    if (n < 0) break
-                    read += n
-                }
-                String(buffer, 0, read, StandardCharsets.UTF_8)
-            } else {
-                ""
-            }
+            // 非法 Content-Length 不能静默当成 0（会被解析成空 body），直接 400。
+            val length = headers["content-length"]?.toLongOrNull()
+                ?: if (headers.containsKey("content-length")) -1L else 0L
 
             BridgeStatus.recordRequest("${requestLine.substringBefore(" ")} ${requestLine.split(" ").getOrNull(1).orEmpty()}")
 
@@ -244,9 +279,27 @@ class BridgeServer(
                 sendJson(output, 403, """{"error":{"message":"origin not allowed","type":"origin_not_allowed"}}""")
                 return
             }
+            // 先鉴权、再按 Content-Length 分配：未通过校验的请求不该影响内存。
+            if (length < 0) {
+                sendJson(output, 400, """{"error":{"message":"bad content-length","type":"bad_request"}}""")
+                return
+            }
             if (length > requestBodyLimit) {
                 sendJson(output, 413, """{"error":{"message":"request too large","type":"too_large"}}""")
                 return
+            }
+            val body = if (length > 0) {
+                val size = length.toInt()
+                val buffer = ByteArray(size)
+                var read = 0
+                while (read < size) {
+                    val n = input.read(buffer, read, size - read)
+                    if (n < 0) break
+                    read += n
+                }
+                String(buffer, 0, read, StandardCharsets.UTF_8)
+            } else {
+                ""
             }
 
             when {
@@ -290,12 +343,14 @@ class BridgeServer(
     }
 
     /** Reads one CRLF-terminated line as bytes; the request head is ASCII. */
-    private fun readLine(input: InputStream): String? {
+    private fun readLine(input: InputStream, limit: Int = Int.MAX_VALUE): String? {
         val buffer = StringBuilder()
         while (true) {
             val b = input.read()
             if (b < 0) return if (buffer.isEmpty()) null else buffer.toString()
             if (b == '\n'.code) return buffer.toString().removeSuffix("\r")
+            // 超长行直接拒绝：未鉴权阶段不能让客户端无限撑大 StringBuilder。
+            if (buffer.length >= limit) return null
             buffer.append(b.toChar())
         }
     }
@@ -377,7 +432,7 @@ class BridgeServer(
                     // code 11101), so a client asking for a single response is
                     // served by aggregating that stream here rather than by
                     // asking the upstream for something it will not do.
-                    val usage = if (serveWholeResponse) {
+                    val (usage, interrupted) = if (serveWholeResponse) {
                         aggregate(output, result, model, format)
                     } else {
                         relay(output, result, model, format)
@@ -386,7 +441,11 @@ class BridgeServer(
                         CallRecord(
                             timestamp = started,
                             model = model,
-                            outcome = CallRecord.Outcome.OK,
+                            outcome = if (interrupted) {
+                                CallRecord.Outcome.FAILED
+                            } else {
+                                CallRecord.Outcome.OK
+                            },
                             promptTokens = usage.prompt,
                             completionTokens = usage.completion,
                             credits = usage.credits,
@@ -417,7 +476,7 @@ class BridgeServer(
         result: UpstreamClient.ChatResult.Ok,
         model: String,
         format: ApiFormat,
-    ): SseUsage {
+    ): Pair<SseUsage, Boolean> {
         val content = StringBuilder()
         val reasoning = StringBuilder()
         val calls = JSONArray()
@@ -457,6 +516,14 @@ class BridgeServer(
             }
         } catch (e: Exception) {
             android.util.Log.e(TAG, "chat aggregation interrupted", e)
+            // 上游断流时不能再返回一个“正常完成”的 JSON，否则客户端与调用记录
+            // 都会把半截回答当成功。
+            sendJson(
+                output,
+                502,
+                """{"error":{"message":"upstream stream interrupted","type":"bad_gateway"}}""",
+            )
+            return usage to true
         }
 
         val message = JSONObject().apply {
@@ -486,7 +553,7 @@ class BridgeServer(
         // simpler than mapping it field by field as it is assembled.
         val answer = ApiAdapters.fromChatResponse(payload, format, model)
         sendJson(output, 200, answer.toString())
-        return usage
+        return usage to false
     }
 
     /**
@@ -527,7 +594,7 @@ class BridgeServer(
         result: UpstreamClient.ChatResult.Ok,
         model: String,
         format: ApiFormat,
-    ): SseUsage {
+    ): Pair<SseUsage, Boolean> {
         output.write(
             (
                 "HTTP/1.1 200 OK\r\n" +
@@ -554,6 +621,7 @@ class BridgeServer(
         var carry = ""
         var usage = SseUsage()
         var finishReason: String? = null
+        var interrupted = false
         try {
             while (true) {
                 val read = result.stream.read(buffer)
@@ -587,12 +655,16 @@ class BridgeServer(
             }
         } catch (e: Exception) {
             android.util.Log.e(TAG, "chat relay interrupted", e)
+            interrupted = true
         }
-        adapter.finish(finishReason, usage.prompt, usage.completion).forEach {
-            output.write(it.toByteArray(StandardCharsets.UTF_8))
+        // 断流时不要补 finish / response.completed：那会把半截回答伪装成正常结束。
+        if (!interrupted) {
+            adapter.finish(finishReason, usage.prompt, usage.completion).forEach {
+                output.write(it.toByteArray(StandardCharsets.UTF_8))
+            }
         }
         output.flush()
-        return usage
+        return usage to interrupted
     }
 
     /**
@@ -601,10 +673,11 @@ class BridgeServer(
      * The bytes the client receives are the ones the upstream sent, so the only
      * work here is scanning for the usage block that reports what was billed.
      */
-    private fun relayRaw(output: OutputStream, result: UpstreamClient.ChatResult.Ok): SseUsage {
+    private fun relayRaw(output: OutputStream, result: UpstreamClient.ChatResult.Ok): Pair<SseUsage, Boolean> {
         val buffer = ByteArray(4096)
         val tail = StringBuilder()
         var usage = SseUsage()
+        var interrupted = false
         try {
             while (true) {
                 val read = result.stream.read(buffer)
@@ -619,8 +692,9 @@ class BridgeServer(
             }
         } catch (e: Exception) {
             android.util.Log.e(TAG, "chat relay interrupted", e)
+            interrupted = true
         }
-        return usage
+        return usage to interrupted
     }
 
     /** Token and credit figures reported by the upstream for one call. */
@@ -785,6 +859,7 @@ class BridgeServer(
         400 -> "Bad Request"
         401 -> "Unauthorized"
         404 -> "Not Found"
+        402 -> "Payment Required"
         403 -> "Forbidden"
         413 -> "Payload Too Large"
         415 -> "Unsupported Media Type"

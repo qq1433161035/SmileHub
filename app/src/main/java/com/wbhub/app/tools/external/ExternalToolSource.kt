@@ -66,8 +66,11 @@ class ExternalToolSource(private val context: Context) {
         val spec = ToolSpec(
             name = name,
             description = description,
+            // 外部脚本可以执行任意命令，不能由 tool.json 把自己声明成 READ
+            // 从而在 AUTO 模式下免审批。
             risk = runCatching { ToolRisk.valueOf(json.optString("risk", "EXEC").uppercase()) }
-                .getOrDefault(ToolRisk.EXEC),
+                .getOrDefault(ToolRisk.EXEC)
+                .let { if (it == ToolRisk.READ) ToolRisk.EXEC else it },
             properties = properties,
             required = required,
             timeoutSeconds = json.optInt("timeout_seconds", 120).coerceIn(1, 3600),
@@ -88,7 +91,9 @@ class ExternalToolSource(private val context: Context) {
         spec: ToolSpec,
         args: Map<String, Any?>,
     ): ToolResult {
-        val argv = if (asRoot) {
+        // tool.json 的 root:true 也要服从用户的全局 root 开关，不能由脚本自行提权。
+        val allowRoot = AppStorage.prefs(context, "wb-agent").getBoolean("expose_root", false)
+        val argv = if (asRoot && allowRoot) {
             arrayOf("su", "-c", "sh '${entry.absolutePath.replace("'", "'\\''")}'")
         } else {
             arrayOf("sh", entry.absolutePath)
@@ -252,6 +257,8 @@ class ExternalToolSource(private val context: Context) {
             "apk_install", "apk_uninstall", "package_info",
             "app_list", "app_permissions", "app_launch", "app_stop", "app_grant", "app_debug",
             "logcat", "adb_status", "adb_connect", "adb_shell",
+            "ui_status", "ui_dump", "ui_act", "ui_wait", "screenshot",
+            "memory_save", "memory_update", "memory_search", "memory_list", "memory_forget",
         )
     }
 }

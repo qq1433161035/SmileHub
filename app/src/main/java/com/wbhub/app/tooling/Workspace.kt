@@ -40,10 +40,15 @@ class Workspace(context: Context) {
 
     fun newProjectId(): String = "p" + UUID.randomUUID().toString().replace("-", "").take(12)
 
-    fun project(id: String): ProjectDirs = ProjectDirs(id, File(root, "projects/$id")).ensure()
+    fun project(id: String): ProjectDirs {
+        // 工程 id 来自模型参数时必须校验：`..` 会落到 workspace 之外建目录。
+        require(PROJECT_ID.matches(id)) { "invalid project id: $id" }
+        return ProjectDirs(id, File(root, "projects/$id")).ensure()
+    }
 
     /** Removes a project's decoded tree, builds and artifacts. */
     fun deleteProject(id: String) {
+        if (!PROJECT_ID.matches(id)) return
         runCatching { File(root, "projects/$id").deleteRecursively() }
     }
 
@@ -89,5 +94,9 @@ class Workspace(context: Context) {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private companion object {
+        val PROJECT_ID = Regex("[A-Za-z0-9_-]{1,64}")
     }
 }

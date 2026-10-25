@@ -8,7 +8,6 @@ import android.os.PowerManager
 import com.wbhub.app.proto.CredentialStore
 import com.wbhub.app.proto.ProtoModel
 import com.wbhub.app.proto.UpstreamClient
-import com.wbhub.app.storage.AppStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,7 +30,9 @@ class BridgeService : Service() {
     }
 
     private val binder = LocalBinder()
-    private val scope = CoroutineScope(Dispatchers.Default + Job())
+    /** 后台协程的生命周期：服务销毁时必须取消，否则刷新循环会一直持有 Context。 */
+    private val scopeJob = Job()
+    private val scope = CoroutineScope(Dispatchers.Default + scopeJob)
     private var models: List<String> = emptyList()
 
     /**
@@ -52,7 +53,7 @@ class BridgeService : Service() {
         private set
 
     /** Key clients must present; editable from the settings screen. */
-    private var apiKey: String = BridgeSettings.DEFAULT_API_KEY
+    private var apiKey: String = ""
 
     /** Whether the process is protected by a foreground notification. */
     @Volatile
@@ -61,7 +62,6 @@ class BridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        AppStorage.init(this)
         store = CredentialStore(this)
         callLog = CallLogStore(this)
         Notifications.ensureChannel(this)
@@ -221,6 +221,8 @@ class BridgeService : Service() {
      */
     fun restartBridge() {
         bridge?.stop()
+        // 设置里刚改过密钥时不能沿用启动时缓存的值。
+        apiKey = BridgeSettings.apiKey(this)
         bridge = BridgeServer(
             port = port,
             secret = apiKey,
@@ -241,6 +243,7 @@ class BridgeService : Service() {
     }
 
     override fun onDestroy() {
+        scopeJob.cancel()
         removeOverlay()
         BridgeStatus.stopped()
         bridge?.stop()

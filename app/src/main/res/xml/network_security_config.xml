@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 保留原有行为：用户下载工具/模型时仍可使用 http。 -->
+    <base-config cleartextTrafficPermitted="true" />
+
+    <!-- 公告域名强制 HTTPS。kangle 只下发 leaf + 中间证书，Android 系统缺少
+         TrustAsia TLS RSA Root CA，这里补上与 ATool 相同的信任锚。 -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">weixiao.asia</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/trustasia_root" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

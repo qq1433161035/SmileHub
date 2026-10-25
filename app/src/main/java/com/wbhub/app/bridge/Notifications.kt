@@ -16,6 +16,7 @@ object Notifications {
 
     const val BRIDGE_CHANNEL = "wb_bridge"
     const val LOGIN_CHANNEL = "wb_login"
+    const val AGENT_CHANNEL = "wb_agent"
     private const val BRIDGE_NOTIFICATION = 8765
     private const val LOGIN_NOTIFICATION = 8766
 
@@ -35,6 +36,13 @@ object Notifications {
                 "登录提醒",
                 NotificationManager.IMPORTANCE_DEFAULT,
             ).apply { description = "凭证获取结果" },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                AGENT_CHANNEL,
+                "智能体运行",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply { description = "长任务进度与后台保活" },
         )
     }
 

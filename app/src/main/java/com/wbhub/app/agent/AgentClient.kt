@@ -33,6 +33,7 @@ class AgentClient {
         data class Text(val delta: String) : Event()
         data class Reasoning(val delta: String) : Event()
         data class ToolStart(val name: String) : Event()
+        data class ToolProgress(val name: String, val message: String) : Event()
         data class ToolEnd(val name: String, val ok: Boolean, val summary: String) : Event()
 
         /**
@@ -100,14 +101,24 @@ class AgentClient {
         tools: AgentTools,
         contextWindow: Int = 0,
         approval: ApprovalMode = ApprovalMode.AUTO,
+        /** 每次工具调用实时读取审批模式：运行中改设置应立即生效。 */
+        approvalProvider: () -> ApprovalMode = { approval },
         /** Blocks until the user answers; runs on the worker thread. */
         ask: (String) -> Boolean = { true },
         maxRounds: Int = DEFAULT_MAX_ROUNDS,
         sessionId: String = "",
         initialCompaction: CompactionState = CompactionState(),
         contextEngine: ContextEngine? = null,
+        /** 长期记忆前缀；只拼进请求体，不写进 transcript。 */
+        systemPreamble: String? = null,
+        /** 系统前缀（基线 + 全局指令 + 记忆）占用的 token，计入上下文预算。 */
+        preambleTokens: Int = 0,
+        /** 压缩完成时回调，用于异步建记忆索引。 */
+        onCompaction: ((CompactionState, String?) -> Unit)? = null,
         /** Data URL of an image attached to this prompt, if any. */
         promptImage: String? = null,
+        /** 每轮把最新历史同步给调用方，供中途落盘使用。 */
+        onTranscript: (List<Message>) -> Unit = {},
         onEvent: (Event) -> Unit,
     ): RunResult {
         cancelled = false
@@ -125,6 +136,9 @@ class AgentClient {
         var continued = false
         // 工具定义每次全量发送，属于固定成本，单独计入预算。
         val fixedTokens = ContextBudget.estimateTokens(JSONArray(tools.definitions).toString())
+
+        /** 把最新历史交给调用方；工具边界落盘不能再用上一轮的旧 transcript。 */
+        fun publishTranscript() = onTranscript(transcript.toList())
 
         var round = 0
         while (round < maxRounds) {
@@ -144,7 +158,7 @@ class AgentClient {
                 val step = contextEngine.prepare(
                     messages = transcript,
                     sessionId = sessionId,
-                    toolsTokens = fixedTokens,
+                    toolsTokens = fixedTokens + preambleTokens,
                     state = compaction,
                     summarize = { summaryPrompt ->
                         requestSummary(credential, modelId, summaryPrompt, onEvent)
@@ -152,8 +166,11 @@ class AgentClient {
                 )
                 transcript = step.messages.toMutableList()
                 compaction = step.state
+                publishTranscript()
                 step.compaction?.let {
                     onEvent(Event.Compacted(it.removed, it.summaryTokens, it.archivePath, it.fallback))
+                    // 索引是异步的：压缩本身不能等 SQLite 与向量化。
+                    runCatching { onCompaction?.invoke(step.state, it.archivePath) }
                 }
             }
 
@@ -168,7 +185,7 @@ class AgentClient {
                 onEvent(event)
             }
             var attempt = runCatching {
-                streamTurn(credential, transcript, modelId, effort, contextWindow, tools, relay)
+                streamTurn(credential, transcript, modelId, effort, contextWindow, tools, systemPreamble, relay)
             }
             // Status 0 means the response was never readable: no bytes reached the
             // parser, so one silent retry cannot duplicate a billed answer. The same
@@ -181,7 +198,7 @@ class AgentClient {
                 Log.w(TAG, "transport error, retrying once", failure)
                 Thread.sleep(700)
                 attempt = runCatching {
-                    streamTurn(credential, transcript, modelId, effort, contextWindow, tools, relay)
+                    streamTurn(credential, transcript, modelId, effort, contextWindow, tools, systemPreamble, relay)
                 }
             }
             // 断在半路时接上：把已输出的片段当成半条 assistant 消息，再让模型
@@ -216,6 +233,7 @@ class AgentClient {
                 toolCalls = toolCallsToJson(turn.calls).takeIf { turn.calls.isNotEmpty() },
             )
             produced = true
+            publishTranscript()
 
             if (turn.calls.isEmpty()) {
                 onEvent(Event.Done)
@@ -233,10 +251,17 @@ class AgentClient {
             }
 
             for (call in turn.calls) {
+                if (cancelled) {
+                    transcript += Message(role = "tool", content = "已停止：未执行", toolCallId = call.id)
+                    continue
+                }
                 onEvent(Event.ToolStart(call.name))
                 val args = parseArguments(call.arguments)
-                val outcome = tools.run(call.name, args, approval, ask)
-                onEvent(Event.ToolEnd(call.name, outcome.ok, outcome.text.lineSequence().firstOrNull().orEmpty()))
+                val outcome = tools.run(
+                    call.name, args, approvalProvider(), ask, isCancelled = { cancelled },
+                ) { message ->
+                    onEvent(Event.ToolProgress(call.name, message))
+                }
                 transcript += Message(
                     role = "tool",
                     content = outcome.text,
@@ -250,6 +275,9 @@ class AgentClient {
                         image = image,
                     )
                 }
+                // 先同步历史再发 ToolEnd：ToolEnd 会触发落盘。
+                publishTranscript()
+                onEvent(Event.ToolEnd(call.name, outcome.ok, outcome.text.lineSequence().firstOrNull().orEmpty()))
             }
         }
 
@@ -316,6 +344,8 @@ class AgentClient {
             val error = if (status in 200..299) "" else runCatching {
                 opened.errorStream?.readBytes()?.toString(StandardCharsets.UTF_8).orEmpty()
             }.getOrDefault("")
+            // 被拒绝的这一次不会再被使用；不断开会把连接留给 GC，重试一次就泄漏一条。
+            if (status !in 200..299) opened.disconnect()
             Gzip.Attempt(opened, status, error)
         }
         val conn = attempt.value
@@ -369,9 +399,10 @@ class AgentClient {
         effort: String?,
         contextWindow: Int,
         tools: AgentTools,
+        systemPreamble: String?,
         onEvent: (Event) -> Unit,
     ): Turn {
-        val body = buildBody(transcript, modelId, effort, contextWindow, tools, credential)
+        val body = buildBody(transcript, modelId, effort, contextWindow, tools, credential, systemPreamble)
         val region = credential.region
         val identity = ChatIdentity.forRegion(region)
         // Compressed for the same reason the bridge does it: the transcript is
@@ -406,6 +437,7 @@ class AgentClient {
             val error = if (status in 200..299) "" else runCatching {
                 opened.errorStream?.readBytes()?.toString(StandardCharsets.UTF_8).orEmpty()
             }.getOrDefault("")
+            if (status !in 200..299) opened.disconnect()
             Gzip.Attempt(opened, status, error)
         }
         val conn = attempt.value
@@ -518,8 +550,18 @@ class AgentClient {
         contextWindow: Int,
         tools: AgentTools,
         credential: Credential,
+        systemPreamble: String?,
     ): JSONObject {
         val messages = JSONArray()
+        // 长期记忆只进请求体：不写 transcript，就不会被压缩摘要或重新落盘。
+        if (!systemPreamble.isNullOrBlank()) {
+            val content = if (credential.region == Wire.Region.GLOBAL) {
+                "${Wire.INTERNATIONAL_SYSTEM_PROMPT}\n\n$systemPreamble"
+            } else {
+                systemPreamble
+            }
+            messages.put(JSONObject().put("role", "system").put("content", content))
+        }
         for (message in transcript) {
             val row = JSONObject().apply {
                 put("role", message.role)
@@ -620,6 +662,12 @@ class AgentClient {
             outputStream.use { it.write(body) }
         }
 
+    /**
+     * 停止标记。
+     *
+     * 由主线程写入、工作线程读取，必须是 volatile：否则工具循环可能一直
+     * 读到旧值，表现就是“点了停止没反应”。
+     */
     @Volatile
     private var cancelled = false
 

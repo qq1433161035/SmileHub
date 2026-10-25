@@ -256,7 +256,7 @@ private fun ProjectDetail(detail: ToolingProjectDetail, onDelete: () -> Unit) {
         if (detail.artifacts.isEmpty()) {
             item { Hint("还没有产物。解码、构建或签名后会出现在这里。") }
         } else {
-            items(detail.artifacts, key = { it.path + it.sha256 }) { artifact ->
+            items(detail.artifacts) { artifact ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -301,7 +301,7 @@ private fun ProjectDetail(detail: ToolingProjectDetail, onDelete: () -> Unit) {
         if (detail.operations.isEmpty()) {
             item { Hint("还没有操作记录。") }
         } else {
-            items(detail.operations, key = { it.startedAt.toString() + it.tool }) { operation ->
+            items(detail.operations) { operation ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {

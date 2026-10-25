@@ -9,6 +9,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import com.wbhub.app.agent.AgentStore
 import com.wbhub.app.agent.AgentTools
 import com.wbhub.app.agent.ApprovalMode
+import com.wbhub.app.agent.SubagentLimits
+import com.wbhub.app.agent.SystemPrompts
 import com.wbhub.app.bridge.CallRecord
 import com.wbhub.app.bridge.AccountTotals
 import com.wbhub.app.bridge.DotShape
@@ -135,6 +137,23 @@ data class AgentState(
     val compactKeepTurns: Int = 6,
     /** 工具输出超过多少字符落盘。 */
     val offloadChars: Int = 32_000,
+    /** 用户自定义全局指令；内置基线始终注入。 */
+    val systemPrompt: String = "",
+    /** 是否注入用户全局指令。 */
+    val systemPromptEnabled: Boolean = true,
+    /** 当前生效的内置基线；可被用户覆盖。 */
+    val systemBaseline: String = SystemPrompts.BASELINE,
+    /** 同时运行的子代理数量，1–4。 */
+    val subagentConcurrency: Int = SubagentLimits.DEFAULT_CONCURRENT,
+    /** 长期记忆总开关。 */
+    val memoryEnabled: Boolean = false,
+    /** 每次提问最多注入多少条记忆。 */
+    val memoryTopK: Int = 5,
+    /** 召回最低分，0–100。 */
+    val memoryMinScore: Int = 30,
+    /** 记忆条目数与占用空间，用于设置页展示。 */
+    val memoryCount: Int = 0,
+    val memoryBytes: Long = 0,
     val storageGranted: Boolean = false,
     val workDir: String = AgentTools.defaultWorkDir().absolutePath,
     /** Title of the conversation in progress, shown next to the session picker. */
