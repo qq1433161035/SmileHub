@@ -4,7 +4,7 @@ name: build
 # always downloadable without tagging a release first.
 #
 # The release APK is signed with the same key the published versions use, so it
-# installs over an existing app. Signing material lives in repository secrets;
+# installs over an existing app. Siging material lives in repository secrets;
 # when they are absent the release build still runs but produces an unsigned
 # APK, which is a legible outcome rather than a failed build.
 
